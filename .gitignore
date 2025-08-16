@@ -22,3 +22,4 @@ prisma/*.sqlite
 # Editor
 .vscode/
 .idea/
+.env
