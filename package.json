@@ -26,8 +26,9 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.1",
+    "openai": "^5.13.1",
     "pg": "^8.16.3",
-    "zod": "^4.0.17"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
