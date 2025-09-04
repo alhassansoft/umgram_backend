@@ -21,6 +21,49 @@ const ensureStrArray = (x: unknown): string[] =>
 
 const uniqStr = (arr: ReadonlyArray<string>): string[] => Array.from(new Set(arr));
 
+/** Tokenize a string to lowercase word tokens (ASCII letters + apostrophes) */
+function getWordTokens(s: string): string[] {
+  return (s.toLowerCase().match(/[a-z']+/g) ?? []).filter(Boolean);
+}
+
+/** Load English stopwords from env STOPWORDS_EN (JSON array of strings) */
+function getStopwordSet(): Set<string> {
+  const raw = process.env.STOPWORDS_EN;
+  if (!raw) return new Set<string>();
+  try {
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      const out = new Set<string>();
+      for (const v of arr) if (typeof v === "string") out.add(v.toLowerCase());
+      return out;
+    }
+  } catch {
+    // ignore invalid JSON
+  }
+  return new Set<string>();
+}
+
+/** Load misspellings map from environment (JSON). Example: {"futbal":"football","dont":"don't"} */
+function getMisspellingsMap(): Record<string, string> {
+  const raw = process.env.MISSPELLINGS_MAP;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof k === "string" && typeof v === "string") {
+          out[k.toLowerCase()] = v.toLowerCase();
+        }
+      }
+      return out;
+    }
+  } catch {
+    // ignore invalid JSON and fall back to empty map
+  }
+  return {};
+}
+
 /** Detect negation (EN; supports curly/straight apostrophes) */
 function isNegatedText(q: string): boolean {
   const negEN =
@@ -35,18 +78,11 @@ function hasOverlap(a: Set<string>, b: Set<string>): boolean {
 
 /** Minimal common misspelling normalization for high-impact tokens */
 function getNormalizedTokens(q: string): string[] {
-  const MAP: Record<string, string> = {
-    futbal: "football",
-    footbal: "football",
-    fotball: "football",
-    futbol: "football",
-    dont: "don't",
-    wont: "won't",
-  };
+  const misspellingsMap = getMisspellingsMap();
   const toks = (q.toLowerCase().match(/[a-z']+/g) ?? []).filter(Boolean);
   const out = new Set<string>();
   for (const t of toks) {
-    const norm = MAP[t];
+    const norm = misspellingsMap[t];
     if (norm) out.add(norm);
   }
   return Array.from(out);
@@ -287,11 +323,6 @@ function buildMainBody(args: {
     should.push({ match: { "content.std":  { query: rawQuery, fuzziness: "AUTO", minimum_should_match: "15%", boost: 0.8 } } });
     should.push({ match: { "content.ascii":{ query: rawQuery, fuzziness: "AUTO", minimum_should_match: "15%", boost: 0.6 } } });
   should.push({ match: { "inquiry_en":   { query: rawQuery, fuzziness: "AUTO", minimum_should_match: "15%", boost: 0.6 } } });
-    // Common misspelling direct catch
-    if (/\bfutbal\b/i.test(rawQuery)) {
-      should.push({ match: { "content":  { query: "football", fuzziness: "AUTO", boost: 0.9 } } });
-      should.push({ match: { "inquiry_en":  { query: "football", fuzziness: "AUTO", boost: 0.9 } } });
-    }
   }
 
   for (const e of entitiesQ) {
@@ -546,9 +577,9 @@ export async function searchDiariesSemantic(
   const knnFilterMust: any[] = [];
   // Normalize entity tokens to avoid over-filtering on typos/pronouns
   const PRONOUNS = new Set(["i","you","he","she","it","we","they","me","him","her","us","them"]);
-  const MAP: Record<string, string> = { futbal: "football", footbal: "football", fotball: "football", futbol: "football" };
+  const misspellingsMap2 = getMisspellingsMap();
   const entsForFilter = entitiesQ
-    .map((e) => MAP[e] || e)
+    .map((e) => misspellingsMap2[e] || e)
     .filter((e) => e && e.length >= 3 && !PRONOUNS.has(e));
   if (mode === "strict" && entsForFilter.length) {
     knnFilterMust.push({
@@ -585,6 +616,13 @@ export async function searchDiariesSemantic(
   // 5) Strict post-filter: prefer negation-aware buckets
   if (hits.length && mode === "strict" && actionsQ.length > 0) {
     const qSensitiveAll = new Set<string>(actionsQ.map(low).filter(Boolean));
+  // Attribute-like tokens from query (e.g., 'scary'): dynamic, not hardcoded
+  const qTokens = new Set<string>(getWordTokens(userQuery));
+  for (const a of actionsQ) qTokens.delete(low(a));
+  for (const e of entitiesQ) qTokens.delete(low(e));
+  // remove stopwords if provided via env
+  const stopset = getStopwordSet();
+  if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
 
     hits = hits.filter((h) => {
       const src: any = h._source || {};
@@ -599,15 +637,38 @@ export async function searchDiariesSemantic(
           .filter(Boolean)
       );
 
-      if (wantPol === "affirmative" && docAffVerbBag.size && hasOverlap(qSensitiveAll, docAffVerbBag)) {
-        return true;
-      }
-      if (wantPol === "negative" && docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag)) {
-        return true;
+  const hasAffOverlap = docAffVerbBag.size && hasOverlap(qSensitiveAll, docAffVerbBag);
+  const hasNegOverlap = docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag);
+  const hasAnyVerbOverlap = docVerbBag.size > 0 && hasOverlap(qSensitiveAll, docVerbBag);
+
+      // Attribute negation evidence (e.g., "wasn't scary") detected dynamically
+      const docText = toStr((src.content as string) || (src.title as string) || "").toLowerCase();
+      let docHasAttrNegation = false;
+      if (docNegVerbBag.has("be") && qTokens.size) {
+        for (const t of qTokens) {
+          if (t.length < 3) continue;
+          if (docText.includes(t)) { docHasAttrNegation = true; break; }
+        }
       }
 
-      if (docPol && docPol !== wantPol) return false;
-      return docVerbBag.size === 0 ? true : hasOverlap(qSensitiveAll, docVerbBag);
+      // Attribute-negation takes precedence over verb overlap
+      if (docHasAttrNegation) {
+        if (wantPol === "negative") return true;   // e.g., "not scary" satisfies negative intent
+        if (wantPol === "affirmative") return false; // exclude for positive "scary" intent
+      }
+
+      // Prefer polarity-aligned evidence when available
+      if (wantPol === "affirmative" && hasAffOverlap) return true;
+      if (wantPol === "negative" && hasNegOverlap)   return true;
+
+  // If verbs overlap, keep the hit and let the answer selector resolve nuanced negation/attributes
+  if (hasAnyVerbOverlap) return true;
+
+  // Only reject on explicit, conflicting polarity when no other evidence exists
+  if ((docPol === "affirmative" || docPol === "negative") && docPol !== wantPol) return false;
+
+  // Otherwise, keep neutral/unspecified docs
+  return true;
     });
   }
 
@@ -633,6 +694,11 @@ export async function searchDiariesSemantic(
 
     if (mode === "strict" && actionsQ.length > 0) {
       const qSensitiveAll = new Set<string>(actionsQ.map(low).filter(Boolean));
+  const qTokens = new Set<string>(getWordTokens(userQuery));
+  for (const a of actionsQ) qTokens.delete(low(a));
+  for (const e of entitiesQ) qTokens.delete(low(e));
+  const stopset = getStopwordSet();
+  if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
 
       hits2 = hits2.filter((h) => {
         const src: any = h._source || {};
@@ -647,15 +713,29 @@ export async function searchDiariesSemantic(
             .filter(Boolean)
         );
 
-        if (wantPol === "affirmative" && docAffVerbBag.size && hasOverlap(qSensitiveAll, docAffVerbBag)) {
-          return true;
-        }
-        if (wantPol === "negative" && docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag)) {
-          return true;
+  const hasAffOverlap = docAffVerbBag.size && hasOverlap(qSensitiveAll, docAffVerbBag);
+  const hasNegOverlap = docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag);
+  const hasAnyVerbOverlap = docVerbBag.size > 0 && hasOverlap(qSensitiveAll, docVerbBag);
+
+        const docText = toStr((src.content as string) || (src.title as string) || "").toLowerCase();
+        let docHasAttrNegation = false;
+        if (docNegVerbBag.has("be") && qTokens.size) {
+          for (const t of qTokens) {
+            if (t.length < 3) continue;
+            if (docText.includes(t)) { docHasAttrNegation = true; break; }
+          }
         }
 
-        if (docPol && docPol !== wantPol) return false;
-        return docVerbBag.size === 0 ? true : hasOverlap(qSensitiveAll, docVerbBag);
+        // Attribute-negation precedence
+        if (docHasAttrNegation) {
+          if (wantPol === "negative") return true;
+          if (wantPol === "affirmative") return false;
+        }
+        if (wantPol === "affirmative" && hasAffOverlap) return true;
+        if (wantPol === "negative" && hasNegOverlap)   return true;
+  if (hasAnyVerbOverlap) return true;
+  if ((docPol === "affirmative" || docPol === "negative") && docPol !== wantPol) return false;
+  return true;
       });
     }
 
