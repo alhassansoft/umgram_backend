@@ -360,6 +360,7 @@ function buildMainBody(args: {
     _source: [
       "title",
       "content",
+  "userId",
       "entities",
       "actions",
       "sensitive_en",
@@ -479,6 +480,7 @@ function buildLexicalFallbackBody(args: {
     _source: [
       "title",
       "content",
+  "userId",
       "entities",
       "actions",
       "sensitive_en",
@@ -510,10 +512,14 @@ export async function searchDiariesSemantic(
   userQuery: string,
   opts?: {
     mode?: "wide" | "strict";
+    scope?: "mine" | "others" | "all";
+    userId?: string | null;
     logMeta?: { userId?: string | null; ip?: string | null; ua?: string | null } | null;
   }
 ) {
   const mode = opts?.mode ?? "wide";
+  const scope = opts?.scope ?? "all";
+  const scopeUserId = (opts?.userId || "").trim();
   const started = Date.now();
 
   // 1) Embed the raw query text
@@ -575,6 +581,15 @@ export async function searchDiariesSemantic(
 
   // Optional kNN filter by entities
   const knnFilterMust: any[] = [];
+  // Scope filter (mine, others, all)
+  const docFilterMust: any[] = [];
+  if (scope === "mine" && scopeUserId) {
+    // only my diaries
+    docFilterMust.push({ term: { userId: scopeUserId } });
+  } else if (scope === "others" && scopeUserId) {
+    // exclude my diaries
+    docFilterMust.push({ bool: { must_not: { term: { userId: scopeUserId } } } });
+  }
   // Normalize entity tokens to avoid over-filtering on typos/pronouns
   const PRONOUNS = new Set(["i","you","he","she","it","we","they","me","him","her","us","them"]);
   const misspellingsMap2 = getMisspellingsMap();
@@ -588,6 +603,10 @@ export async function searchDiariesSemantic(
         minimum_should_match: 1,
       },
     });
+  }
+  // Apply scope filters to kNN filter as well
+  if (docFilterMust.length) {
+    knnFilterMust.push(...docFilterMust);
   }
 
   // 4) Hybrid search (kNN + lexical with fuzziness)
@@ -606,6 +625,12 @@ export async function searchDiariesSemantic(
   rawQuery: userQuery,
   });
 
+  // Inject document-level filters (scope) into main query
+  if ((body as any).query?.bool && docFilterMust.length) {
+    const b = (body as any).query.bool;
+    b.filter = Array.isArray(b.filter) ? [...b.filter, ...docFilterMust] : [...docFilterMust];
+  }
+
   const res = await es.search<{ hits: { hits: SearchHit[] } }>({
     index: DIARY_INDEX,
     ...(body as any),
@@ -614,15 +639,16 @@ export async function searchDiariesSemantic(
   let hits = res.hits.hits;
 
   // 5) Strict post-filter: prefer negation-aware buckets
-  if (hits.length && mode === "strict" && actionsQ.length > 0) {
+  if (hits.length && mode === "strict") {
     const qSensitiveAll = new Set<string>(actionsQ.map(low).filter(Boolean));
-  // Attribute-like tokens from query (e.g., 'scary'): dynamic, not hardcoded
-  const qTokens = new Set<string>(getWordTokens(userQuery));
-  for (const a of actionsQ) qTokens.delete(low(a));
-  for (const e of entitiesQ) qTokens.delete(low(e));
-  // remove stopwords if provided via env
-  const stopset = getStopwordSet();
-  if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
+    // Attribute-like tokens from query (e.g., adjectives)
+    const qTokens = new Set<string>(getWordTokens(userQuery));
+    for (const a of actionsQ) qTokens.delete(low(a));
+    for (const e of entitiesQ) qTokens.delete(low(e));
+    const stopset = getStopwordSet();
+    if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
+    const qEntities = new Set<string>(entitiesQ.map(low).filter(Boolean));
+    const negRe = /\b(?:not|no|never|don['’]?t|didn['’]?t|doesn['’]?t|without)\b/;
 
     hits = hits.filter((h) => {
       const src: any = h._source || {};
@@ -641,34 +667,51 @@ export async function searchDiariesSemantic(
   const hasNegOverlap = docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag);
   const hasAnyVerbOverlap = docVerbBag.size > 0 && hasOverlap(qSensitiveAll, docVerbBag);
 
-      // Attribute negation evidence (e.g., "wasn't scary") detected dynamically
       const docText = toStr((src.content as string) || (src.title as string) || "").toLowerCase();
-      let docHasAttrNegation = false;
-      if (docNegVerbBag.has("be") && qTokens.size) {
-        for (const t of qTokens) {
-          if (t.length < 3) continue;
-          if (docText.includes(t)) { docHasAttrNegation = true; break; }
+      // Attribute gating near entity: if query is negative and attribute tokens appear near entity window without negation → exclude
+      const qAttrTokens = new Set<string>(Array.from(qTokens));
+      let attrHit = false;
+      let attrNeg = false;
+      if (qEntities.size > 0 && qAttrTokens.size) {
+        for (const e of Array.from(qEntities)) {
+          if (!docText.includes(e)) continue;
+          const idx = docText.indexOf(e);
+          const start = Math.max(0, idx - 64);
+          const end = Math.min(docText.length, idx + e.length + 64);
+          const win = docText.slice(start, end);
+          for (const t of Array.from(qAttrTokens)) { if (t.length < 3) continue; if (win.includes(t)) { attrHit = true; break; } }
+          if (negRe.test(win)) attrNeg = true;
+          if (attrHit && attrNeg) break;
+        }
+      }
+      if (wantPol === 'negative' && attrHit && !attrNeg) return false;
+
+      // Polarity-aware verb logic
+      if (qSensitiveAll.size > 0) {
+        if (wantPol === 'affirmative') {
+          if (hasAffOverlap || hasAnyVerbOverlap) return true;
+          return false;
+        } else {
+          // negative: require negated overlap, or negation near entity + any verb overlap
+          let negNearEntity = false;
+          if (qEntities.size > 0) {
+            for (const e of Array.from(qEntities)) {
+              if (!docText.includes(e)) continue;
+              const idx = docText.indexOf(e);
+              const start = Math.max(0, idx - 64);
+              const end = Math.min(docText.length, idx + e.length + 64);
+              if (negRe.test(docText.slice(start, end))) { negNearEntity = true; break; }
+            }
+          }
+          if (hasNegOverlap || (negNearEntity && hasAnyVerbOverlap)) return true;
+          return false;
         }
       }
 
-      // Attribute-negation takes precedence over verb overlap
-      if (docHasAttrNegation) {
-        if (wantPol === "negative") return true;   // e.g., "not scary" satisfies negative intent
-        if (wantPol === "affirmative") return false; // exclude for positive "scary" intent
-      }
-
-      // Prefer polarity-aligned evidence when available
-      if (wantPol === "affirmative" && hasAffOverlap) return true;
-      if (wantPol === "negative" && hasNegOverlap)   return true;
-
-  // If verbs overlap, keep the hit and let the answer selector resolve nuanced negation/attributes
-  if (hasAnyVerbOverlap) return true;
-
-  // Only reject on explicit, conflicting polarity when no other evidence exists
-  if ((docPol === "affirmative" || docPol === "negative") && docPol !== wantPol) return false;
-
-  // Otherwise, keep neutral/unspecified docs
-  return true;
+      // No explicit verbs in query: rely on doc polarity and negation presence
+      if ((docPol === 'affirmative' || docPol === 'negative') && docPol !== wantPol) return false;
+      if (wantPol === 'negative' && !negRe.test(docText)) return false;
+      return true;
     });
   }
 
@@ -692,13 +735,25 @@ export async function searchDiariesSemantic(
 
     let hits2 = res2.hits.hits;
 
-    if (mode === "strict" && actionsQ.length > 0) {
+    // Also enforce scope filters on lexical fallback results (post-filtering if needed)
+    if (docFilterMust.length) {
+      hits2 = hits2.filter((h: any) => {
+        const src: any = h._source || {};
+        if (scope === "mine" && scopeUserId) return String(src.userId || "") === scopeUserId;
+        if (scope === "others" && scopeUserId) return String(src.userId || "") !== scopeUserId;
+        return true;
+      });
+    }
+
+    if (mode === "strict") {
       const qSensitiveAll = new Set<string>(actionsQ.map(low).filter(Boolean));
-  const qTokens = new Set<string>(getWordTokens(userQuery));
-  for (const a of actionsQ) qTokens.delete(low(a));
-  for (const e of entitiesQ) qTokens.delete(low(e));
-  const stopset = getStopwordSet();
-  if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
+      const qTokens = new Set<string>(getWordTokens(userQuery));
+      for (const a of actionsQ) qTokens.delete(low(a));
+      for (const e of entitiesQ) qTokens.delete(low(e));
+      const stopset = getStopwordSet();
+      if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
+      const qEntities = new Set<string>(entitiesQ.map(low).filter(Boolean));
+      const negRe = /\b(?:not|no|never|don['’]?t|didn['’]?t|doesn['’]?t|without)\b/;
 
       hits2 = hits2.filter((h) => {
         const src: any = h._source || {};
@@ -718,24 +773,47 @@ export async function searchDiariesSemantic(
   const hasAnyVerbOverlap = docVerbBag.size > 0 && hasOverlap(qSensitiveAll, docVerbBag);
 
         const docText = toStr((src.content as string) || (src.title as string) || "").toLowerCase();
-        let docHasAttrNegation = false;
-        if (docNegVerbBag.has("be") && qTokens.size) {
-          for (const t of qTokens) {
-            if (t.length < 3) continue;
-            if (docText.includes(t)) { docHasAttrNegation = true; break; }
+        // Attribute gating near entity
+        const qAttrTokens = new Set<string>(Array.from(qTokens));
+        let attrHit = false;
+        let attrNeg = false;
+        if (qEntities.size > 0 && qAttrTokens.size) {
+          for (const e of Array.from(qEntities)) {
+            if (!docText.includes(e)) continue;
+            const idx = docText.indexOf(e);
+            const start = Math.max(0, idx - 64);
+            const end = Math.min(docText.length, idx + e.length + 64);
+            const win = docText.slice(start, end);
+            for (const t of Array.from(qAttrTokens)) { if (t.length < 3) continue; if (win.includes(t)) { attrHit = true; break; } }
+            if (negRe.test(win)) attrNeg = true;
+            if (attrHit && attrNeg) break;
+          }
+        }
+        if (wantPol === 'negative' && attrHit && !attrNeg) return false;
+
+        if (qSensitiveAll.size > 0) {
+          if (wantPol === 'affirmative') {
+            if (hasAffOverlap || hasAnyVerbOverlap) return true;
+            return false;
+          } else {
+            let negNearEntity = false;
+            if (qEntities.size > 0) {
+              for (const e of Array.from(qEntities)) {
+                if (!docText.includes(e)) continue;
+                const idx = docText.indexOf(e);
+                const start = Math.max(0, idx - 64);
+                const end = Math.min(docText.length, idx + e.length + 64);
+                if (negRe.test(docText.slice(start, end))) { negNearEntity = true; break; }
+              }
+            }
+            if (hasNegOverlap || (negNearEntity && hasAnyVerbOverlap)) return true;
+            return false;
           }
         }
 
-        // Attribute-negation precedence
-        if (docHasAttrNegation) {
-          if (wantPol === "negative") return true;
-          if (wantPol === "affirmative") return false;
-        }
-        if (wantPol === "affirmative" && hasAffOverlap) return true;
-        if (wantPol === "negative" && hasNegOverlap)   return true;
-  if (hasAnyVerbOverlap) return true;
-  if ((docPol === "affirmative" || docPol === "negative") && docPol !== wantPol) return false;
-  return true;
+        if ((docPol === 'affirmative' || docPol === 'negative') && docPol !== wantPol) return false;
+        if (wantPol === 'negative' && !negRe.test(docText)) return false;
+        return true;
       });
     }
 

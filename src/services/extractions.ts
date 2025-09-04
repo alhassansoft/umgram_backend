@@ -13,7 +13,7 @@ export type PolarityLabel = "affirmative" | "negative" | "unspecified";
 
 /** مدخلات الحفظ */
 export type SaveExtractionArgs = {
-  contentType: "diary" | "post" | "comment" | "other";
+  contentType: "diary" | "note" | "post" | "comment" | "other" | "chat";
   contentId: string | number;
   userId?: string | null;
   payload: ClauseGraphPayload;   // ← full clause/event graph
@@ -218,7 +218,7 @@ export async function saveExtraction(args: SaveExtractionArgs): Promise<{ id: nu
  * الاسترجاع
  * ============================ */
 export async function getExtractionByContent(
-  contentType: "diary" | "post" | "comment" | "other",
+  contentType: "diary" | "note" | "post" | "comment" | "other" | "chat",
   contentId: string | number
 ): Promise<ClauseGraphPayload | null> {
   const idStr = String(contentId);

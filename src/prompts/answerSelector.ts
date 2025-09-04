@@ -59,9 +59,13 @@ OUTPUT SCHEMA (STRICT JSON ONLY)
 EVALUATION RULES
 - Consider ONLY the first 10 hits you are given. Prefer higher-scoring hits but prioritize actual relevance.
 - The answer MUST be supported by explicit evidence: matching entities/actions/phrases or clear highlight spans.
-- Respect negation and time:
-  • If the question implies existence/occurrence (e.g., "is there anyone who went to X"), an event like "went to X" with affirmative polarity and compatible time is a direct "yes".
-  • If available evidence is only negated (e.g., "didn't go"), that does NOT satisfy a positive existence question.
+- Respect negation and time (STRICT):
+  • Positive existence questions (e.g., "is there anyone who went to X") require AFFIRMATIVE evidence of the event.
+  • NEGATED questions (e.g., "is there anyone who did NOT finish re1") require explicit NEGATED evidence for that event, such as:
+    - negated_actions_en includes the action (e.g., "finish re1")
+    - content/highlights clearly state a negation (e.g., "didn't finish re1", "not finished re1", "never finished re1").
+  • If the question is NEGATED and the available evidence is only AFFIRMATIVE (e.g., "finished re1"), this does NOT satisfy the question. In that case, return final.type = "none" with final.text exactly "I don't know".
+  • Similarly, if the question is POSITIVE and only NEGATED evidence exists, answer "no".
 
 - Conjunctions vs. sequence (CRITICAL):
   • Enforce order ONLY when the question contains clear sequence markers:
@@ -94,6 +98,7 @@ QUESTION INTERPRETATION (VERY IMPORTANT)
 - Parse intent from the question, including negation and attribute constraints.
 - Detect sequence ONLY with explicit markers; otherwise treat conjunctions as unordered.
 - Apply the Watch/Show and scary attribute rules above.
+ - Recognize negation markers in English ("not", "no", "don't", "didn't", "never") and in Arabic ("لا", "لم", "لن", "غير").
 
 STYLE
 - Be precise, compact, and faithful to sources.
@@ -129,6 +134,16 @@ QUESTION: "find someone who went to the zoo"
 TOP HITS: none relevant.
 VERDICT: —
 FINAL: type "none" with text exactly: "I don't know".
+
+QUESTION: "is there anyone not finish re1"
+TOP HITS include a document with content: "I finished re1 yesterday." and phrases_en: ["finished re1"].
+VERDICT: — because this is AFFIRMATIVE evidence of finishing, which does not satisfy a NEGATED question.
+FINAL: type "none" with text exactly: "I don't know".
+
+QUESTION: "is there anyone not finish re1"
+TOP HITS include a document with content: "I didn't finish re1." and phrases_en: ["didn't finish re1"], negated_actions_en: ["finish re1"].
+VERDICT: "yes" because there is explicit NEGATED evidence of finishing re1.
+FINAL: type "direct" with text like "Yes — someone did not finish re1." 
 `;
 
 export default ANSWER_SELECTOR_PROMPT;

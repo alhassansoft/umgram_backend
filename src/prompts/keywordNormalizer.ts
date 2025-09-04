@@ -1,4 +1,4 @@
-export const KEYWORD_NORMALIZER_PROMPT = `
+const RAW_PROMPT = `
 You are a multilingual clause segmenter and relation extractor with a Simple-English normalizer.
 
 GOAL
@@ -26,6 +26,7 @@ Return ONLY valid JSON with EXACTLY this shape (no extra keys):
       "id": "c1",
       "kind": "event",
       "subject": "<surface subject NP or name>",
+  "polarity": "affirmative" | "negative",
       "verb": {
         "surface": "<verb as in text>",
         "lemma": "<lemma in SAME language as the surface (no translation)>",
@@ -81,6 +82,7 @@ OUTPUT RULES (STRICT)
 - Deduplicate arrays while preserving meaningful order.
 - Ensure each action_synset and entity_synset has >=5 high-quality synonyms (prefer 8–15 for actions).
 - Keep clause count compact (1–8) and minimal but complete.
+ - For each event clause, set clause-level "polarity": "affirmative" if verb.negation=false, else "negative" if verb.negation=true.
 
 PROCESS
 1) INTERNAL NORMALIZATION (do NOT output): rewrite the input into Simple English preserving entities, actions, time, and polarity.
@@ -91,6 +93,7 @@ PROCESS
    - Create "context" for framing phrases (e.g., "رغم المطر", "بسبب الازدحام", "if it rains").
    - For coordinated events with omitted subjects, inherit from the nearest antecedent.
 3) VERB FEATURES: fill verb {surface, lemma, tense, negation}. negation=true if explicitly negated (AR: لا/لم/لن/ما/ليس/بدون/غير… ; EN: not/didn't/don't/never/without…).
+  - Also set the event-level polarity field: "affirmative" when negation=false, "negative" when negation=true.
 4) RELATIONS: create directed edges in reading order; map connectors to types:
    - and ⇐ و / and / comma coordination without contrast
    - or  ⇐ أو / or
@@ -132,8 +135,8 @@ GUIDANCE EXAMPLE (do not echo in output)
 INPUT: "I went to Taif but did not eat meat"
 - entities: ["Taif","meat"]
 - clauses:
-  c1(event): subject "I", verb.surface "went", lemma "went→go", tense "past", negation false, modifiers.place "to Taif", source_span "went to Taif"
-  c2(event): subject "I", verb.surface "eat",  lemma "eat",     tense "past", negation true,  objects ["meat"],       source_span "did not eat meat"
+  c1(event): subject "I", polarity "affirmative", verb.surface "went", lemma "went→go", tense "past", negation false, modifiers.place "to Taif", source_span "went to Taif"
+  c2(event): subject "I", polarity "negative",     verb.surface "eat",  lemma "eat",     tense "past", negation true,  objects ["meat"],       source_span "did not eat meat"
   relation: {from:"c1", to:"c2", type:"but", connector:"but"}
 - affirmed_actions: ["go"]
 - negated_actions:  ["eat"]
@@ -152,3 +155,5 @@ INPUT: "I went to Taif but did not eat meat"
       { lemma:"meat", type:"common_noun", synonyms:["meat","beef","chicken","protein","food","flesh","grilled meat"] }
     ]
 `;
+
+export const KEYWORD_NORMALIZER_PROMPT = RAW_PROMPT.normalize("NFC");

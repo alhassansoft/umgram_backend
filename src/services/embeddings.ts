@@ -10,7 +10,13 @@ if (!apiKey) {
   console.warn("[embeddings] OPENAI_API_KEY is missing");
 }
 
-const openai = new OpenAI({ apiKey });
+const baseURL =
+  process.env.OPENAI_BASE_URL ||
+  process.env.OPENAI_API_BASE ||
+  process.env.OPENAI_BASE ||
+  undefined;
+if (baseURL) console.warn(`[embeddings] Using custom OpenAI baseURL: ${baseURL}`);
+const openai = new OpenAI({ apiKey, baseURL });
 
 /** نموذج متوافق متعدد اللغات. غيّره إن أردت */
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-3-small"; // dims = 1536 غالباً

@@ -66,8 +66,14 @@ export type ClauseGraphPayload = {
  * OpenAI client
  * ============================ */
 const apiKey = process.env.OPENAI_API_KEY || process.env.OPEN_AI || "";
+const baseURL =
+  process.env.OPENAI_BASE_URL ||
+  process.env.OPENAI_API_BASE ||
+  process.env.OPENAI_BASE ||
+  undefined;
 if (!apiKey) console.warn("[keywordExtractor] OPENAI_API_KEY is missing");
-const openai = new OpenAI({ apiKey });
+if (baseURL) console.warn(`[keywordExtractor] Using custom OpenAI baseURL: ${baseURL}`);
+const openai = new OpenAI({ apiKey, baseURL });
 
 // Default LLM model (enable GPT-5 Preview for all callers unless overridden)
 // Use env LLM_MODEL or OPENAI_CHAT_MODEL to override. Safe fallback is gpt-4o-mini.
@@ -315,7 +321,7 @@ async function runClauseGraph(
   } catch (err: any) {
     const msg = String(err?.message || err);
     const code = err?.code || err?.status || err?.name;
-    const shouldFallback = model !== FALLBACK_LLM_MODEL && /model|not found|unsupported|invalid_model/i.test(msg + " " + code);
+    const shouldFallback = model !== FALLBACK_LLM_MODEL && (/model|not found|unsupported|invalid_model|invalid url/i.test(msg + " " + code) || Number(code) === 404);
     if (shouldFallback) {
       console.warn(`[keywordExtractor] Model '${model}' failed (${code ?? ""}). Falling back to '${FALLBACK_LLM_MODEL}'.`);
       completion = await openai.chat.completions.create({

@@ -36,8 +36,26 @@ export type AnswerSelectionResult = {
 };
 
 const apiKey = process.env.OPENAI_API_KEY || process.env.OPEN_AI || "";
-if (!apiKey) console.warn("[answerSelector] OPENAI_API_KEY is missing");
-const openai = new OpenAI({ apiKey });
+const baseURL =
+  process.env.OPENAI_BASE_URL ||
+  process.env.OPENAI_API_BASE ||
+  process.env.OPENAI_BASE ||
+  undefined;
+if (!apiKey) console.warn("[answerSelector] OPENAI_API_KEY is missing — falling back to 'none' answers");
+if (baseURL) console.warn(`[answerSelector] Using custom OpenAI baseURL: ${baseURL}`);
+// Prefer custom client when baseURL is provided, keep a default fallback client too
+const openaiCustom = apiKey ? new OpenAI({ apiKey, baseURL }) : (null as any);
+const openaiDefault = apiKey ? new OpenAI({ apiKey }) : (null as any);
+
+function buildNoneResult(question: string, considered = 0): AnswerSelectionResult {
+  return {
+    question: String(question || "").trim(),
+    considered_count: considered,
+    candidates: [],
+    answers: [],
+    final: { type: "none", text: "" },
+  };
+}
 
 function toMinimal(h: any): MinimalHit | null {
   if (!h) return null;
@@ -90,6 +108,10 @@ export async function selectAnswer(
   hits: Array<any>,
   opts?: { model?: string; temperature?: number }
 ): Promise<AnswerSelectionResult> {
+  if (!apiKey) {
+    // No API key configured; return a safe empty result
+    return buildNoneResult(question, Array.isArray(hits) ? Math.min(hits.length, 10) : 0);
+  }
   const model = opts?.model ?? DEFAULT_LLM_MODEL;
   const temperature = opts?.temperature ?? 0;
 
@@ -110,7 +132,8 @@ export async function selectAnswer(
   // First try with configured/default model, then fall back to a safe model once if needed
   let completion;
   try {
-    completion = await openai.chat.completions.create({
+    const client = baseURL ? openaiCustom : openaiDefault;
+    completion = await client.chat.completions.create({
       model,
       temperature,
       messages: [
@@ -121,23 +144,54 @@ export async function selectAnswer(
   } catch (err: any) {
     const msg = String(err?.message || err);
     const code = err?.code || err?.status || err?.name;
-    const shouldFallback = model !== FALLBACK_LLM_MODEL && /model|not found|unsupported|invalid_model/i.test(msg + " " + code);
-    if (!shouldFallback) throw err;
+    const shouldFallback =
+      model !== FALLBACK_LLM_MODEL &&
+      (/model|not found|unsupported|invalid_model|invalid url/i.test(msg + " " + code) || Number(code) === 404);
+    if (!shouldFallback) {
+      // Any other error (network, auth, rate-limit) -> return safe empty result
+      return buildNoneResult(question, trimmed.length);
+    }
     console.warn(`[answerSelector] Model '${model}' failed (${code ?? ""}). Falling back to '${FALLBACK_LLM_MODEL}'.`);
-    completion = await openai.chat.completions.create({
-      model: FALLBACK_LLM_MODEL,
-      temperature,
-      messages: [
-        { role: "system", content: ANSWER_SELECTOR_PROMPT },
-        { role: "user", content: JSON.stringify(payload) },
-      ],
-    });
+    // Attempt 1: use same client (custom if provided) with fallback model
+    try {
+      const client1 = baseURL ? openaiCustom : openaiDefault;
+      completion = await client1.chat.completions.create({
+        model: FALLBACK_LLM_MODEL,
+        temperature,
+        messages: [
+          { role: "system", content: ANSWER_SELECTOR_PROMPT },
+          { role: "user", content: JSON.stringify(payload) },
+        ],
+      });
+    } catch (err2: any) {
+      const msg2 = String(err2?.message || err2);
+      const code2 = err2?.code || err2?.status || err2?.name;
+      console.warn(`[answerSelector] Fallback model failed on current client (${code2 ?? ""}): ${msg2}`);
+      // Attempt 2: if a custom baseURL is configured, retry with default client (no baseURL)
+      if (baseURL) {
+        try {
+          completion = await openaiDefault.chat.completions.create({
+            model: FALLBACK_LLM_MODEL,
+            temperature,
+            messages: [
+              { role: "system", content: ANSWER_SELECTOR_PROMPT },
+              { role: "user", content: JSON.stringify(payload) },
+            ],
+          });
+        } catch (err3: any) {
+          console.warn(`[answerSelector] Default client also failed: ${String(err3?.message || err3)}`);
+          return buildNoneResult(question, trimmed.length);
+        }
+      } else {
+        return buildNoneResult(question, trimmed.length);
+      }
+    }
   }
 
   const content = completion.choices[0]?.message?.content || "";
   const parsed = tryParseJSON(content);
   if (!parsed) {
-    throw new Error("Failed to parse answer selector JSON");
+    return buildNoneResult(question, trimmed.length);
   }
   return parsed as AnswerSelectionResult;
 }

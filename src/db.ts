@@ -27,17 +27,19 @@ export function query<
   return pool.query<T>(text, params);
 }
 
-// إغلاق أنيق
-async function gracefulShutdown() {
-  try {
-    await pool.end();
-    // console.log('PG pool closed');
-  } finally {
-    process.exit(0);
+// إغلاق أنيق (انتاج فقط): تجنب إغلاق الـ pool في التطوير لتفادي مشاكل ts-node-dev أثناء إعادة التحميل
+if (process.env.NODE_ENV === 'production') {
+  async function gracefulShutdown() {
+    try {
+      await pool.end();
+      // console.log('PG pool closed');
+    } finally {
+      process.exit(0);
+    }
   }
+  process.on('SIGINT', gracefulShutdown);
+  process.on('SIGTERM', gracefulShutdown);
 }
-process.on('SIGINT', gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
 
 // اختياري: فحص اتصال سريع عند التشغيل
 (async () => {

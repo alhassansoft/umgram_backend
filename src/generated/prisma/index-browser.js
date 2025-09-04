@@ -120,9 +120,141 @@ exports.Prisma.TransactionIsolationLevel = makeStrictEnum({
   Serializable: 'Serializable'
 });
 
+exports.Prisma.ChatConversationScalarFieldEnum = {
+  id: 'id',
+  userId: 'userId',
+  title: 'title',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt'
+};
+
+exports.Prisma.ChatMessageScalarFieldEnum = {
+  id: 'id',
+  conversationId: 'conversationId',
+  role: 'role',
+  text: 'text',
+  source: 'source',
+  mode: 'mode',
+  answersCount: 'answersCount',
+  finalType: 'finalType',
+  meta: 'meta',
+  createdAt: 'createdAt'
+};
+
+exports.Prisma.ConfessionConversationScalarFieldEnum = {
+  id: 'id',
+  userId: 'userId',
+  title: 'title',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt'
+};
+
+exports.Prisma.ConfessionMessageScalarFieldEnum = {
+  id: 'id',
+  conversationId: 'conversationId',
+  role: 'role',
+  text: 'text',
+  createdAt: 'createdAt'
+};
+
+exports.Prisma.MediaAlbumScalarFieldEnum = {
+  id: 'id',
+  userId: 'userId',
+  title: 'title',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt'
+};
+
+exports.Prisma.MediaAssetScalarFieldEnum = {
+  id: 'id',
+  albumId: 'albumId',
+  uri: 'uri',
+  mime: 'mime',
+  size: 'size',
+  width: 'width',
+  height: 'height',
+  createdAt: 'createdAt'
+};
+
+exports.Prisma.MatchRequestScalarFieldEnum = {
+  id: 'id',
+  requesterId: 'requesterId',
+  query: 'query',
+  mode: 'mode',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt',
+  status: 'status',
+  approvedCandidateId: 'approvedCandidateId'
+};
+
+exports.Prisma.MatchCandidateScalarFieldEnum = {
+  id: 'id',
+  requestId: 'requestId',
+  candidateUserId: 'candidateUserId',
+  sourceDocId: 'sourceDocId',
+  snippet: 'snippet',
+  status: 'status',
+  decidedAt: 'decidedAt',
+  createdAt: 'createdAt'
+};
+
+exports.Prisma.SortOrder = {
+  asc: 'asc',
+  desc: 'desc'
+};
+
+exports.Prisma.NullableJsonNullValueInput = {
+  DbNull: Prisma.DbNull,
+  JsonNull: Prisma.JsonNull
+};
+
+exports.Prisma.QueryMode = {
+  default: 'default',
+  insensitive: 'insensitive'
+};
+
+exports.Prisma.NullsOrder = {
+  first: 'first',
+  last: 'last'
+};
+
+exports.Prisma.JsonNullValueFilter = {
+  DbNull: Prisma.DbNull,
+  JsonNull: Prisma.JsonNull,
+  AnyNull: Prisma.AnyNull
+};
+exports.ChatSource = exports.$Enums.ChatSource = {
+  DIARY: 'DIARY',
+  NOTE: 'NOTE'
+};
+
+exports.ChatMode = exports.$Enums.ChatMode = {
+  WIDE: 'WIDE',
+  STRICT: 'STRICT'
+};
+
+exports.MatchRequestStatus = exports.$Enums.MatchRequestStatus = {
+  PENDING: 'PENDING',
+  MATCHED: 'MATCHED',
+  NOT_FOUND: 'NOT_FOUND',
+  CANCELED: 'CANCELED'
+};
+
+exports.MatchCandidateStatus = exports.$Enums.MatchCandidateStatus = {
+  PENDING: 'PENDING',
+  APPROVED: 'APPROVED',
+  DENIED: 'DENIED'
+};
 
 exports.Prisma.ModelName = {
-
+  ChatConversation: 'ChatConversation',
+  ChatMessage: 'ChatMessage',
+  ConfessionConversation: 'ConfessionConversation',
+  ConfessionMessage: 'ConfessionMessage',
+  MediaAlbum: 'MediaAlbum',
+  MediaAsset: 'MediaAsset',
+  MatchRequest: 'MatchRequest',
+  MatchCandidate: 'MatchCandidate'
 };
 
 /**

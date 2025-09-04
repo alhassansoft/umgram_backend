@@ -11,5 +11,159 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // Use a dedicated connection string to avoid touching existing public tables
+  // Set DATABASE_URL_CHAT in your .env, e.g. a separate database or same DB with limited perms
+  url      = env("DATABASE_URL_CHAT")
+}
+
+// =======================================
+// Chat persistence (conversations/messages)
+// =======================================
+
+enum ChatSource {
+  DIARY
+  NOTE
+}
+
+enum ChatMode {
+  WIDE
+  STRICT
+}
+
+model ChatConversation {
+  id        String        @id @default(cuid())
+  userId    String?
+  title     String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  messages  ChatMessage[]
+
+  @@index([userId])
+}
+
+model ChatMessage {
+  id              String           @id @default(cuid())
+  conversationId  String
+  conversation    ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  role            String           // 'user' | 'assistant'
+  text            String
+  source          ChatSource?
+  mode            ChatMode?
+  answersCount    Int?
+  finalType       String?
+  meta            Json?
+
+  createdAt       DateTime         @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+// =======================================
+// Confession persistence (separate tables)
+// =======================================
+
+model ConfessionConversation {
+  id        String                 @id @default(cuid())
+  userId    String?
+  title     String?
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+
+  messages  ConfessionMessage[]
+
+  @@index([userId])
+}
+
+model ConfessionMessage {
+  id              String                    @id @default(cuid())
+  conversationId  String
+  conversation    ConfessionConversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  role            String                    // 'user' | 'assistant'
+  text            String
+
+  createdAt       DateTime                  @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+// =======================================
+// Media Albums (server-backed)
+// =======================================
+
+model MediaAlbum {
+  id        String        @id @default(cuid())
+  userId    String
+  title     String
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  assets    MediaAsset[]
+
+  @@index([userId])
+}
+
+model MediaAsset {
+  id        String      @id @default(cuid())
+  albumId   String
+  album     MediaAlbum  @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  uri       String      // public URL like /uploads/media/xxx
+  mime      String?
+  size      Int?
+  width     Int?
+  height    Int?
+
+  createdAt DateTime    @default(now())
+
+  @@index([albumId, createdAt])
+}
+
+// =======================================
+// Matchmaking consent workflow
+// =======================================
+
+enum MatchCandidateStatus {
+  PENDING
+  APPROVED
+  DENIED
+}
+
+enum MatchRequestStatus {
+  PENDING
+  MATCHED
+  NOT_FOUND
+  CANCELED
+}
+
+model MatchRequest {
+  id                  String              @id @default(cuid())
+  requesterId         String
+  query               String
+  mode                ChatMode?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  status              MatchRequestStatus  @default(PENDING)
+  approvedCandidateId String?
+
+  candidates          MatchCandidate[]
+
+  @@index([requesterId])
+}
+
+model MatchCandidate {
+  id               String               @id @default(cuid())
+  requestId        String
+  request          MatchRequest         @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  candidateUserId  String
+  sourceDocId      String?
+  snippet          String?
+  status           MatchCandidateStatus @default(PENDING)
+  decidedAt        DateTime?
+  createdAt        DateTime             @default(now())
+
+  @@index([candidateUserId])
+  @@index([requestId, status])
 }
