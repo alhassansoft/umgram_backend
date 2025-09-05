@@ -11,11 +11,12 @@ export interface DBUser {
   status: UserStatus;
   email_verified_at: string | null;
   last_login_at: string | null;
+  profile_image: string | null;
   meta: any;
   created_at: string;
   updated_at: string;
 }
 
 export type SafeUser = Pick<
-  DBUser, 'id' | 'email' | 'username' | 'display_name' | 'role' | 'status' | 'created_at'
+  DBUser, 'id' | 'email' | 'username' | 'display_name' | 'role' | 'status' | 'profile_image' | 'created_at'
 >;

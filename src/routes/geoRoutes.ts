@@ -207,6 +207,8 @@ function haversineMeters(a: { lat: number; lng: number }, b: { lat: number; lng:
 // Circle chat: list messages (requires location to validate access)
 router.get('/circles/:id/chat/messages', requireAuth, async (req, res, next) => {
   try {
+    const userId = String(req.user?.sub || '');
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
     const lat = Number((req.query.lat as string) ?? '');
@@ -216,11 +218,14 @@ router.get('/circles/:id/chat/messages', requireAuth, async (req, res, next) => 
     }
     const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 100)));
 
-    const cr = await query('SELECT id, lat, lng, radius FROM user_circles WHERE id = $1', [id]);
+    const cr = await query('SELECT id, user_id, lat, lng, radius FROM user_circles WHERE id = $1', [id]);
     const circle = cr.rows[0];
     if (!circle) return res.status(404).json({ error: 'circle not found' });
     const d = haversineMeters({ lat, lng }, { lat: Number(circle.lat), lng: Number(circle.lng) });
-    if (d > Number(circle.radius)) return res.status(403).json({ error: 'outside circle' });
+    // Allow the circle owner to bypass the geofence constraint
+    if (d > Number(circle.radius) && String(circle.user_id) !== userId) {
+      return res.status(403).json({ error: 'outside circle' });
+    }
 
     const r = await query(
       `SELECT m.id, m.circle_id, m.user_id, u.username, u.display_name, m.text, m.lat, m.lng, m.created_at
@@ -248,11 +253,14 @@ router.post('/circles/:id/chat/messages', requireAuth, async (req, res, next) =>
     if (!text) return res.status(400).json({ error: 'text required' });
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ error: 'lat,lng required' });
 
-    const cr = await query('SELECT id, lat, lng, radius FROM user_circles WHERE id = $1', [id]);
+    const cr = await query('SELECT id, user_id, lat, lng, radius FROM user_circles WHERE id = $1', [id]);
     const circle = cr.rows[0];
     if (!circle) return res.status(404).json({ error: 'circle not found' });
     const d = haversineMeters({ lat, lng }, { lat: Number(circle.lat), lng: Number(circle.lng) });
-    if (d > Number(circle.radius)) return res.status(403).json({ error: 'outside circle' });
+    // Allow the circle owner to bypass the geofence constraint
+    if (d > Number(circle.radius) && String(circle.user_id) !== userId) {
+      return res.status(403).json({ error: 'outside circle' });
+    }
 
     const r = await query(
       `INSERT INTO user_circle_messages (circle_id, user_id, text, lat, lng)

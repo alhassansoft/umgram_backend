@@ -40,3 +40,35 @@ export async function deleteAsset(userId: string, assetId: string) {
   await prisma.mediaAsset.delete({ where: { id: assetId } });
   return asset;
 }
+
+// -------------------------------
+// Diary-specific helpers (album)
+// -------------------------------
+
+/**
+ * Returns a deterministic title used to map a diary entry to its media album.
+ * Using a title avoids schema changes while keeping assets grouped per-diary.
+ */
+export function diaryAlbumTitle(diaryId: string) {
+  return `diary:${diaryId}`;
+}
+
+/**
+ * Find or create the album for a given diary (by diaryId) owned by the user.
+ */
+export async function getOrCreateDiaryAlbum(userId: string, diaryId: string) {
+  const title = diaryAlbumTitle(diaryId);
+  let album = await prisma.mediaAlbum.findFirst({ where: { userId, title } });
+  if (!album) {
+    album = await prisma.mediaAlbum.create({ data: { userId, title } });
+  }
+  return album;
+}
+
+/**
+ * Fetch the album (if exists) for a given diary. Returns null if not found.
+ */
+export async function getDiaryAlbum(userId: string, diaryId: string) {
+  const title = diaryAlbumTitle(diaryId);
+  return prisma.mediaAlbum.findFirst({ where: { userId, title } });
+}

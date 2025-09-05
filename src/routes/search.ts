@@ -1,10 +1,7 @@
 // /Users/alhassanalabdli/Desktop/umgram/backend/src/routes/search.ts
 import { Router, Request, Response, NextFunction } from "express";
 import { es } from "../lib/es";
-import type {
-  QueryDslOperator,
-  QueryDslQueryContainer,
-} from "@elastic/elasticsearch/lib/api/types";
+import type { estypes } from "@elastic/elasticsearch";
 import { searchDiariesSemantic } from "../search/diarySearch";
 import { NOTE_INDEX } from "../search/noteIndex";
 import { searchNotesSemantic } from "../search/noteSearch";
@@ -1124,7 +1121,7 @@ search.get(
       const qRaw = String(req.query.q ?? "");
       const size = clampInt(req.query.size as string | undefined, 20, 1, 100);
       const from = clampInt(req.query.from as string | undefined, 0, 0, 10_000);
-      const op: QueryDslOperator =
+  const op: estypes.QueryDslOperator =
         String(req.query.op ?? "or").toLowerCase() === "and" ? "and" : "or";
       const langParam = String(req.query.lang ?? "").toLowerCase();
       const userId = (req.query.userId ? String(req.query.userId) : "").trim();
@@ -1139,17 +1136,17 @@ search.get(
 
       const noteFields = ["title^2", "content"]; 
 
-      let baseQuery: QueryDslQueryContainer;
+  let baseQuery: estypes.QueryDslQueryContainer;
       if (hasAdvancedOps) {
         baseQuery = {
           simple_query_string: { query: q, fields: noteFields as string[], default_operator: op },
         };
       } else if (isArabic) {
         const tokens = q.split(/\s+/).filter(Boolean);
-        const mm: QueryDslQueryContainer = {
+  const mm: estypes.QueryDslQueryContainer = {
           multi_match: { query: q, fields: noteFields as string[], operator: op, type: "best_fields" },
         };
-        const wildcardMust: QueryDslQueryContainer[] = tokens.map((t) => ({
+  const wildcardMust: estypes.QueryDslQueryContainer[] = tokens.map((t) => ({
           query_string: {
             query: `*${t}*`,
             fields: noteFields as string[],
@@ -1172,7 +1169,7 @@ search.get(
         };
       }
 
-      const query: QueryDslQueryContainer = userId
+  const query: estypes.QueryDslQueryContainer = userId
         ? { bool: { must: [baseQuery, { term: { userId } }] } }
         : baseQuery;
 
@@ -1275,7 +1272,7 @@ search.get(
       const qRaw = String(req.query.q ?? "");
       const size = clampInt(req.query.size as string | undefined, 20, 1, 100);
       const from = clampInt(req.query.from as string | undefined, 0, 0, 10_000);
-      const op: QueryDslOperator =
+  const op: estypes.QueryDslOperator =
         String(req.query.op ?? "or").toLowerCase() === "and" ? "and" : "or";
       const langParam = String(req.query.lang ?? "").toLowerCase();
 
@@ -1290,7 +1287,7 @@ search.get(
       const arFields = ["title.ar^5", "body.ar^3", "title.s^6"];
       const enFields = ["title.en^5", "body.en^3", "title.s^6", "title^2", "body"];
 
-      let query: QueryDslQueryContainer;
+  let query: estypes.QueryDslQueryContainer;
 
       if (hasAdvancedOps) {
         // دعم العبارات/المعاملات (~ " ^ | ( ) + - * )
@@ -1303,7 +1300,7 @@ search.get(
         };
       } else if (isArabic) {
         // ===== العربي: multi_match + fallback wildcards لكل كلمة =====
-        const base: QueryDslQueryContainer = {
+  const base: estypes.QueryDslQueryContainer = {
           multi_match: {
             query: q,
             fields: arFields as string[],
@@ -1314,7 +1311,7 @@ search.get(
 
         // نجزّئ الكلمات العربية ونبني MUST من *token*
         const tokens = q.split(/\s+/).filter(Boolean);
-        const wildcardMust: QueryDslQueryContainer[] = tokens.map((t) => ({
+  const wildcardMust: estypes.QueryDslQueryContainer[] = tokens.map((t) => ({
           // query_string مع wildcards؛ نفعّل AND داخل هذا المسار
           query_string: {
             query: `*${t}*`,
@@ -1324,7 +1321,7 @@ search.get(
           } as any,
         }));
 
-        const wildcardPath: QueryDslQueryContainer =
+  const wildcardPath: estypes.QueryDslQueryContainer =
           wildcardMust.length > 0
             ? { bool: { must: wildcardMust } }
             : base;
@@ -1482,7 +1479,7 @@ search.get(
       const qRaw = String(req.query.q ?? "");
       const size = clampInt(req.query.size as string | undefined, 20, 1, 100);
       const from = clampInt(req.query.from as string | undefined, 0, 0, 10_000);
-      const op: QueryDslOperator =
+  const op: estypes.QueryDslOperator =
         String(req.query.op ?? "or").toLowerCase() === "and" ? "and" : "or";
       const langParam = String(req.query.lang ?? "").toLowerCase();
       const userId = (req.query.userId ? String(req.query.userId) : "").trim();
@@ -1498,7 +1495,7 @@ search.get(
       // حقول اليوميات (كما في المابّينغ المقترح)
       const diaryFields = ["title^2", "content"];
 
-      let baseQuery: QueryDslQueryContainer;
+  let baseQuery: estypes.QueryDslQueryContainer;
 
       if (hasAdvancedOps) {
         baseQuery = {
@@ -1511,7 +1508,7 @@ search.get(
       } else if (isArabic) {
         const tokens = q.split(/\s+/).filter(Boolean);
 
-        const mm: QueryDslQueryContainer = {
+  const mm: estypes.QueryDslQueryContainer = {
           multi_match: {
             query: q,
             fields: diaryFields as string[],
@@ -1520,7 +1517,7 @@ search.get(
           },
         };
 
-        const wildcardMust: QueryDslQueryContainer[] = tokens.map((t) => ({
+  const wildcardMust: estypes.QueryDslQueryContainer[] = tokens.map((t) => ({
           query_string: {
             query: `*${t}*`,
             fields: diaryFields as string[],
@@ -1549,7 +1546,7 @@ search.get(
       }
 
       // فلتر userId إن وُجد
-      const query: QueryDslQueryContainer = userId
+  const query: estypes.QueryDslQueryContainer = userId
         ? { bool: { must: [baseQuery, { term: { userId } }] } }
         : baseQuery;
 

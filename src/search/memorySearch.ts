@@ -1,6 +1,6 @@
 import { es } from "../lib/es";
 import { MEMORY_INDEX, ensureMemoryIndex } from "./memoryIndex";
-import type { QueryDslQueryContainer } from "@elastic/elasticsearch/lib/api/types";
+import type { estypes } from "@elastic/elasticsearch";
 
 export async function searchMemory(
   userId: string,
@@ -17,7 +17,7 @@ export async function searchMemory(
   const engTokens = q.toLowerCase().match(/[a-z]+/g) ?? [];
   const hasShortToken = engTokens.some((t) => t.length < 3);
 
-  const base: QueryDslQueryContainer = {
+  const base: estypes.QueryDslQueryContainer = {
     multi_match: {
       query: q,
       fields: fields as string[],
@@ -27,10 +27,10 @@ export async function searchMemory(
     },
   };
 
-  const filters: QueryDslQueryContainer[] = [{ term: { userId } }];
+  const filters: estypes.QueryDslQueryContainer[] = [{ term: { userId } }];
   if (opts.tableId) filters.push({ term: { tableId: opts.tableId } });
 
-  const query: QueryDslQueryContainer = { bool: { must: [base, ...filters] } };
+  const query: estypes.QueryDslQueryContainer = { bool: { must: [base, ...filters] } };
 
   const result = await es.search({ index: MEMORY_INDEX, from, size, query, highlight: { fields: { content: {} } } });
   const hits = (result.hits.hits ?? []).map((h: any) => ({ id: h._id, score: h._score, ...(h._source ?? {}), highlight: h.highlight }));

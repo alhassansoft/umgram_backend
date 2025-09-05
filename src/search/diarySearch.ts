@@ -516,7 +516,7 @@ export async function searchDiariesSemantic(
     userId?: string | null;
     logMeta?: { userId?: string | null; ip?: string | null; ua?: string | null } | null;
   }
-) {
+): Promise<SearchHit[]> {
   const mode = opts?.mode ?? "wide";
   const scope = opts?.scope ?? "all";
   const scopeUserId = (opts?.userId || "").trim();
@@ -527,7 +527,7 @@ export async function searchDiariesSemantic(
 
   // 2) Query-time clause graph (+ optional en_simple)
   // Use default LLM model (GPT-5 preview if available)
-  const { DEFAULT_LLM_MODEL } = await import("../services/keywordExtractor");
+  const { DEFAULT_LLM_MODEL } = await import("../services/keywordExtractor.js");
   const payload = await expandQuery(userQuery, { model: DEFAULT_LLM_MODEL, temperature: 0 });
   const en = fromEnSimple(payload as any);
 
@@ -631,12 +631,12 @@ export async function searchDiariesSemantic(
     b.filter = Array.isArray(b.filter) ? [...b.filter, ...docFilterMust] : [...docFilterMust];
   }
 
-  const res = await es.search<{ hits: { hits: SearchHit[] } }>({
+  const res = await es.search<unknown>({
     index: DIARY_INDEX,
     ...(body as any),
   });
 
-  let hits = res.hits.hits;
+  let hits: SearchHit[] = (res as any).hits.hits as any;
 
   // 5) Strict post-filter: prefer negation-aware buckets
   if (hits.length && mode === "strict") {
@@ -728,12 +728,12 @@ export async function searchDiariesSemantic(
   rawQuery: userQuery,
     });
 
-    const res2 = await es.search<{ hits: { hits: SearchHit[] } }>({
+  const res2 = await es.search<unknown>({
       index: DIARY_INDEX,
       ...(lexBody as any),
     });
 
-    let hits2 = res2.hits.hits;
+  let hits2: SearchHit[] = (res2 as any).hits.hits as any;
 
     // Also enforce scope filters on lexical fallback results (post-filtering if needed)
     if (docFilterMust.length) {
