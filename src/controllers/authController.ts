@@ -3,6 +3,15 @@ import { register, login, rotateTokens } from '../services/authService';
 
 export async function registerController(req: Request, res: Response) {
   try {
+    // تعطيل التسجيل أثناء فترة البيتا
+    return res.status(423).json({ 
+      error: 'التسجيل معطل مؤقتاً - التطبيق في وضع البيتا للحسابات المختارة مسبقاً فقط',
+      message: 'Registration temporarily disabled - App is in beta mode for pre-selected accounts only',
+      beta: true
+    });
+
+    // الكود القديم للتسجيل (معطل مؤقتاً)
+    /*
     const { email, username, password, displayName } = req.body ?? {};
     if (!email || !username || !password) {
       return res.status(400).json({ error: 'email, username, password required' });
@@ -12,6 +21,7 @@ export async function registerController(req: Request, res: Response) {
     }
     const result = await register({ email, username, password, displayName });
     res.status(201).json(result);
+    */
   } catch (err: any) {
     res.status(err.status || 500).json({ error: err.message || 'Server error' });
   }

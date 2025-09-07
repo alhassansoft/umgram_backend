@@ -1,4 +1,4 @@
-export type UserRole = 'admin' | 'editor' | 'reviewer' | 'member';
+export type UserRole = 'user' | 'admin' | 'supervisor';
 export type UserStatus = 'active' | 'inactive' | 'suspended';
 
 export interface DBUser {

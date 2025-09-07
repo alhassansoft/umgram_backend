@@ -22,6 +22,7 @@ import geoRoutes from "./routes/geoRoutes";
 import challengeRoutes from "./routes/challengeRoutes";
 import notificationsRoutes from "./routes/notificationsRoutes";
 import searchHistoryRoutes from "./routes/searchHistoryRoutes";
+import adminRoutes from "./routes/adminRoutes";
 
 // ❌ لا تستخدم searchRoutes القديم
 // import searchRoutes from "./routes/searchRoutes";
@@ -111,6 +112,7 @@ app.use(challengeRoutes);
 app.use(matchRoutes);
 app.use(notificationsRoutes);
 app.use(searchHistoryRoutes);
+app.use(adminRoutes);
 
 // ⚠️ مهم: راوتر البحث الجديد يعلن المسارات بنفسه (يتضمن /api/search)
 // لذلك لا تُضيف بادئة /api هنا حتى لا تصبح /api/api/search.

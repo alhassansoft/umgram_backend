@@ -41,10 +41,29 @@ export async function listMyConversations(req: Request, res: Response, next: Nex
   try {
     const me = req.user?.sub;
     if (!me) return res.status(401).json({ error: 'Unauthorized' });
-    const result = await query<{ id: string; updated_at: string }>(
-      `SELECT dc.id, dc.updated_at
+    
+    const result = await query(
+      `SELECT 
+         dc.id, 
+         dc.updated_at,
+         last_msg.text as last_message_text,
+         last_msg.created_at as last_message_time,
+         sender.username as last_sender_username,
+         sender.display_name as last_sender_display_name,
+         other_user.username as other_username,
+         other_user.display_name as other_display_name
        FROM direct_conversations dc
        JOIN direct_conversation_participants p ON p.conversation_id = dc.id
+       LEFT JOIN LATERAL (
+         SELECT dm.text, dm.created_at, dm.sender_id
+         FROM direct_messages dm
+         WHERE dm.conversation_id = dc.id
+         ORDER BY dm.created_at DESC
+         LIMIT 1
+       ) last_msg ON true
+       LEFT JOIN users sender ON sender.id = last_msg.sender_id
+       LEFT JOIN direct_conversation_participants other_p ON other_p.conversation_id = dc.id AND other_p.user_id != $1
+       LEFT JOIN users other_user ON other_user.id = other_p.user_id
        WHERE p.user_id = $1
        ORDER BY dc.updated_at DESC
        LIMIT 100`,
@@ -70,10 +89,19 @@ export async function getMessages(
     if (!member.rowCount) return res.status(403).json({ error: 'Forbidden' });
 
     const msgs = await query(
-      `SELECT id, sender_id, text, created_at, delivered_at, read_at
-       FROM direct_messages
-       WHERE conversation_id = $1
-       ORDER BY created_at ASC
+      `SELECT 
+         dm.id, 
+         dm.sender_id, 
+         dm.text, 
+         dm.created_at, 
+         dm.delivered_at, 
+         dm.read_at,
+         u.username,
+         u.display_name
+       FROM direct_messages dm
+       LEFT JOIN users u ON u.id = dm.sender_id
+       WHERE dm.conversation_id = $1
+       ORDER BY dm.created_at ASC
        LIMIT 500`,
       [id]
     );

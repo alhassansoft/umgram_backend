@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { query } from '../db';
+import { createNotification } from '../services/notifications';
 
 const router = Router();
 
@@ -228,7 +229,7 @@ router.get('/circles/:id/chat/messages', requireAuth, async (req, res, next) => 
     }
 
     const r = await query(
-      `SELECT m.id, m.circle_id, m.user_id, u.username, u.display_name, m.text, m.lat, m.lng, m.created_at
+      `SELECT m.id, m.circle_id, m.user_id, u.username, u.display_name, m.text, m.lat, m.lng, m.created_at, m.anonymous
        FROM user_circle_messages m
        LEFT JOIN users u ON u.id::text = m.user_id
        WHERE m.circle_id = $1
@@ -250,6 +251,7 @@ router.post('/circles/:id/chat/messages', requireAuth, async (req, res, next) =>
     const text = String(req.body?.text ?? '').trim();
     const lat = Number(req.body?.lat);
     const lng = Number(req.body?.lng);
+    const anonymous = Boolean(req.body?.anonymous ?? false);
     if (!text) return res.status(400).json({ error: 'text required' });
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ error: 'lat,lng required' });
 
@@ -263,18 +265,90 @@ router.post('/circles/:id/chat/messages', requireAuth, async (req, res, next) =>
     }
 
     const r = await query(
-      `INSERT INTO user_circle_messages (circle_id, user_id, text, lat, lng)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO user_circle_messages (circle_id, user_id, text, lat, lng, anonymous)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id`,
-      [id, userId, text, lat, lng]
+      [id, userId, text, lat, lng, anonymous]
     );
     const mid = r.rows[0]?.id;
     const rr = await query(
-      `SELECT m.id, m.circle_id, m.user_id, u.username, u.display_name, m.text, m.lat, m.lng, m.created_at
+      `SELECT m.id, m.circle_id, m.user_id, u.username, u.display_name, m.text, m.lat, m.lng, m.created_at, m.anonymous
        FROM user_circle_messages m LEFT JOIN users u ON u.id::text = m.user_id
        WHERE m.id = $1`,
       [mid]
     );
+    
+    // Create notifications for circle owner and other users who have sent messages in this circle
+    try {
+      console.log(`🔔 Creating notifications for circle ${id}, sender: ${userId}`);
+      
+      // Get circle owner info
+      const circleOwnerQuery = await query(
+        `SELECT c.user_id, u.display_name, u.username, c.name
+         FROM user_circles c 
+         LEFT JOIN users u ON u.id::text = c.user_id
+         WHERE c.id = $1`,
+        [id]
+      );
+      
+      // Get other users who have sent messages in this circle (excluding current sender)
+      const otherUsersQuery = await query(
+        `SELECT DISTINCT m.user_id, u.display_name, u.username
+         FROM user_circle_messages m 
+         LEFT JOIN users u ON u.id::text = m.user_id
+         WHERE m.circle_id = $1 AND m.user_id != $2`,
+        [id, userId]
+      );
+      
+      const senderInfo = await query(
+        `SELECT display_name, username FROM users WHERE id::text = $1`,
+        [userId]
+      );
+      
+      const actualSenderName = senderInfo.rows[0]?.display_name || senderInfo.rows[0]?.username || 'مستخدم';
+      const senderName = anonymous ? 'مجهول' : actualSenderName;
+      const circleOwner = circleOwnerQuery.rows[0];
+      const circleName = circleOwner?.name || 'دائرة';
+      
+      console.log(`🔔 Circle owner: ${circleOwner?.user_id}, sender: ${userId}, anonymous: ${anonymous}`);
+      
+      // Send notification to circle owner if they're not the sender
+      if (circleOwner && circleOwner.user_id !== userId) {
+        console.log(`🔔 Sending notification to circle owner: ${circleOwner.user_id}`);
+        await createNotification({
+          userId: circleOwner.user_id,
+          type: 'circle_message',
+          message: `رسالة جديدة من ${senderName} في دائرتك "${circleName}": ${text.slice(0, 50)}${text.length > 50 ? '...' : ''}`,
+          requestId: String(id) // Store circle ID as requestId
+        });
+      } else {
+        console.log(`🔔 Skipping owner notification (owner is sender or not found)`);
+      }
+      
+      // Send notifications to other users who have participated in the circle
+      console.log(`🔔 Other participants: ${otherUsersQuery.rows.length}`);
+      for (const otherUser of otherUsersQuery.rows) {
+        // Skip if this user is the circle owner (already notified above)
+        if (otherUser.user_id === circleOwner?.user_id) {
+          console.log(`🔔 Skipping ${otherUser.user_id} (is circle owner)`);
+          continue;
+        }
+        
+        console.log(`🔔 Sending notification to participant: ${otherUser.user_id}`);
+        await createNotification({
+          userId: otherUser.user_id,
+          type: 'circle_message',
+          message: `رسالة جديدة من ${senderName} في ${circleName}: ${text.slice(0, 50)}${text.length > 50 ? '...' : ''}`,
+          requestId: String(id) // Store circle ID as requestId
+        });
+      }
+      
+      console.log(`🔔 Notification creation completed for circle ${id}`);
+    } catch (notifError) {
+      // Don't fail the main request if notification creation fails
+      console.warn('Failed to create circle message notifications:', notifError);
+    }
+    
     res.status(201).json(rr.rows[0]);
   } catch (err) { next(err); }
 });
