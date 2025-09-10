@@ -1,7 +1,7 @@
 // src/controllers/extractionsController.ts
 import { Request, Response, NextFunction } from "express";
 import { DiaryModel } from "../models/diaryModel";
-import { extractKeywords, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
+import { extractKeywords, extractKeywordsChunked, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
 import { saveExtraction, getExtractionByContent } from "../services/extractions";
 import { attachExtractionToDiaryInES } from "../search/diaryIndex";
 
@@ -25,7 +25,16 @@ export async function rebuildDiaryExtraction(req: Request, res: Response, next: 
     if (!diary) return res.status(404).json({ error: "Diary not found" });
 
     const text = `${diary.title}\n\n${diary.content ?? ""}`;
-  const payload = await extractKeywords(text, { model: DEFAULT_LLM_MODEL, temperature: 0 });
+    
+    // Use chunked extraction for long diary entries to avoid timeouts
+    const payload = text.length > 3000 
+      ? await extractKeywordsChunked(text, { 
+          model: DEFAULT_LLM_MODEL, 
+          temperature: 0,
+          maxTokensPerChunk: 1800,
+          mergeStrategy: 'intelligent'
+        })
+      : await extractKeywords(text, { model: DEFAULT_LLM_MODEL, temperature: 0 });
 
     const { id: extractionId } = await saveExtraction({
       contentType: "diary",
@@ -40,7 +49,7 @@ export async function rebuildDiaryExtraction(req: Request, res: Response, next: 
     // دفع إلى Elasticsearch
     await attachExtractionToDiaryInES(diary, payload);
 
-    return res.json({ ok: true, id: extractionId, payload });
+    return res.json({ ok: true, id: extractionId, payload, chunked: text.length > 3000 });
   } catch (err) { next(err); }
 }
 

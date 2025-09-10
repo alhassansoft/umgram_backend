@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { prisma } from "../lib/prisma";
 import { buildConfessionMessages, generateConfessionReply } from "../services/confessionAssistant";
-import { extractKeywords, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
+import { extractKeywords, extractKeywordsChunked, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
 import { getExtractionByContent, saveExtraction } from "../services/extractions";
 
 export async function createSession(
@@ -224,7 +224,15 @@ export async function rebuildConfessionExtraction(
     if (msgs.length === 0) return res.status(400).json({ error: "no messages" });
     const combined = msgs.map(m => `${m.role === "assistant" ? "المساعد" : "المستخدم"}: ${m.text}`).join("\n");
 
-    const payload = await extractKeywords(combined, { model: DEFAULT_LLM_MODEL, temperature: 0 });
+    // Use chunked extraction for long conversation histories to avoid timeouts
+    const payload = combined.length > 3000 
+      ? await extractKeywordsChunked(combined, { 
+          model: DEFAULT_LLM_MODEL, 
+          temperature: 0,
+          maxTokensPerChunk: 1800,
+          mergeStrategy: 'intelligent'
+        })
+      : await extractKeywords(combined, { model: DEFAULT_LLM_MODEL, temperature: 0 });
     await saveExtraction({
       contentType: "chat",
       contentId: id,

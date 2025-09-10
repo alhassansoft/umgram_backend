@@ -43,6 +43,10 @@ search.get(
   const scope: "mine" | "others" | "all" = scopeParam === 'mine' ? 'mine' : scopeParam === 'others' ? 'others' : 'all';
   const userId = (req as any).user?.sub || String(req.query.userId ?? "").trim() || null;
   const matchRequestId = String(req.query.matchRequestId ?? "").trim() || null;
+      const limitParam = Number(req.query.limit);
+      const topLimit = Number.isFinite(limitParam) && limitParam > 0 && limitParam <= 50
+        ? limitParam
+        : (Number(process.env.SEARCH_TOP_LIMIT_DEFAULT) || 5);
 
       if (!q) return res.json({ count: 0, hits: [], mode, scope });
       if ((scope === 'mine' || scope === 'others') && !userId) {
@@ -66,19 +70,19 @@ search.get(
     }
   }
 
-  const hits = await searchDiariesSemantic(q, { mode, scope, userId, logMeta: { userId: userId ?? null, ip: (req.ip ?? null) as any, ua: req.get('user-agent') || null } });
+  const rawHits = await searchDiariesSemantic(q, { mode, scope, userId, logMeta: { userId: userId ?? null, ip: (req.ip ?? null) as any, ua: req.get('user-agent') || null } });
 
   // Redact sensitive fields for other users unless consent is matched for the approved candidate
   const redact = (h: any) => ({ _id: h._id, _score: h._score, _source: { redacted: true }, highlight: undefined });
-  let safeHits: any[] = hits;
+  let safeHits: any[] = rawHits;
   if (scope === 'others') {
-    safeHits = (hits || []).map((h: any) => {
+    safeHits = (rawHits || []).map((h: any) => {
       const ownerId = String(h?._source?.userId || '');
       const unredact = approvedCandidateUserId && ownerId === approvedCandidateUserId;
       return unredact ? h : redact(h);
     });
   } else if (scope === 'all') {
-    safeHits = (hits || []).map((h: any) => {
+    safeHits = (rawHits || []).map((h: any) => {
       const ownerId = String(h?._source?.userId || '');
       const isMine = userId && ownerId === String(userId);
       const isApproved = approvedCandidateUserId && ownerId === approvedCandidateUserId;
@@ -86,7 +90,19 @@ search.get(
     });
   }
 
-  return res.json({ count: (safeHits || []).length, hits: safeHits, mode, scope });
+  const reduced = reduceHits(safeHits, topLimit);
+  // Apply snippet truncation here too
+  const trimmed = reduced.map((h:any)=>{
+    try {
+      if (h?._source?.redacted) return h; // keep redacted minimal
+      const srcContent = String(h?._source?.content||'');
+      const hi = (h as any).highlight || {};
+      const hiContent = Array.isArray(hi.content) && hi.content[0] ? hi.content[0] : null;
+      const snippet = extractSnippet(srcContent, q, hiContent);
+      return { ...h, _source: { ...h._source, snippet, content: snippet, truncated: true, original_length: srcContent.length } };
+    } catch { return h; }
+  });
+  return res.json({ count: trimmed.length, totalRaw: (safeHits || []).length, limit: topLimit, hits: trimmed, mode, scope });
     } catch (err) {
       next(err);
     }
@@ -116,13 +132,17 @@ search.get(
       const userIdFromHeader = (req.get('x-user-id') || '').trim() || null;
       const userIdFromQuery = req.query.userId ? String(req.query.userId) : null;
       const userId: string | null = authUser || userIdFromHeader || userIdFromQuery;
+      const limitParam = Number(req.query.limit);
+      const topLimit = Number.isFinite(limitParam) && limitParam > 0 && limitParam <= 50
+        ? limitParam
+        : (Number(process.env.SEARCH_TOP_LIMIT_DEFAULT) || 5);
 
       if (!q) return res.json({ count: 0, hits: [], mode, scope });
 
       // Always query ES across all; then filter client-side per scope
-      const hits = await searchDiariesSemantic(q, { mode, scope: 'all', userId: null });
+  const rawHits = await searchDiariesSemantic(q, { mode, scope: 'all', userId: null });
 
-      let filtered = hits || [];
+  let filtered = rawHits || [];
       if ((scope === 'mine' || scope === 'others') && !userId) {
         return res.status(400).json({ error: "userId is required for scope=mine|others (authenticate or pass userId via header/query)", mode, scope });
       }
@@ -132,10 +152,263 @@ search.get(
         filtered = filtered.filter((h: any) => String(h?._source?.userId || '') !== String(userId));
       }
 
-  return res.json({ count: filtered.length, hits: filtered, mode, scope, method });
+      const reduced = reduceHits(filtered, topLimit);
+      const trimmed = reduced.map((h:any)=>{
+        try {
+          const srcContent = String(h?._source?.content||'');
+          const hi = (h as any).highlight || {};
+          const hiContent = Array.isArray(hi.content) && hi.content[0] ? hi.content[0] : null;
+          const snippet = extractSnippet(srcContent, q, hiContent);
+          return { ...h, _source: { ...h._source, snippet, content: snippet, truncated: true, original_length: srcContent.length } };
+        } catch { return h; }
+      });
+  return res.json({ count: trimmed.length, totalRaw: filtered.length, limit: topLimit, hits: trimmed, mode, scope, method });
     } catch (err) { next(err); }
   }
 );
+
+/**
+ * Reduce hits to top K non-near-duplicates to lower LLM token usage.
+ * Simple similarity based on token overlap (approx Jaccard using min size denominator) + score ordering.
+ */
+function reduceHits(hits: any[], max: number): any[] {
+  if (!Array.isArray(hits) || hits.length <= max) return hits || [];
+  const ordered = [...hits].sort((a, b) => (b?._score || 0) - (a?._score || 0));
+  const kept: any[] = [];
+  for (const h of ordered) {
+    if (kept.length >= max) break;
+    const content = String(h?._source?.content || h?._source?.title || '').toLowerCase();
+    const tokens = new Set(content.split(/\s+/).filter(Boolean));
+    let duplicate = false;
+    for (const ex of kept) {
+      const exContent = String(ex?._source?.content || ex?._source?.title || '').toLowerCase();
+      const exTokens = new Set(exContent.split(/\s+/).filter(Boolean));
+      let inter = 0;
+      for (const t of tokens) if (exTokens.has(t)) inter++;
+      const denom = Math.max(1, Math.min(tokens.size, exTokens.size));
+      const similarity = inter / denom; // biased toward smaller set => good for near-duplicate detection
+      if (similarity > 0.85) { duplicate = true; break; }
+    }
+    if (duplicate) continue;
+    kept.push(h);
+  }
+  return kept;
+}
+
+/**
+ * استخراج مقطع مقتضب (snippet) من المحتوى يطابق السؤال.
+ * - يستعمل أول مقطع highlight إن وُجد.
+ * - وإلا يبحث عن أول ظهور لأي كلمة رئيسية من السؤال داخل المحتوى ويقص نافذة حولها.
+ * - وإلا يأخذ أول N حرف.
+ */
+function extractSnippet(content: string, question: string, highlightFragment?: string | null, maxChars = Number(process.env.ANSWER_SNIPPET_MAX_CHARS)||280): string {
+  if (!content) return '';
+  // 1) استعمل الـ highlight إن وُجد (يفترض أنه أقرب تطابق دلالي)
+  if (highlightFragment) {
+    const frag = highlightFragment.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+    if (frag.length > 0) return frag.slice(0, maxChars);
+  }
+  const clean = content.replace(/\s+/g,' ').trim();
+  if (clean.length <= maxChars) return clean;
+
+  // 2) بناء قائمة كلمات السؤال (إزالة التكرار وفلترة القصير جداً)
+  const qTokens = Array.from(new Set(
+    question
+      .split(/[^\p{L}0-9]+/u)
+      .map(w=>w.trim())
+      .filter(w => w.length >= 2)
+  )).slice(0, 16);
+
+  const lowerClean = clean.toLowerCase();
+
+  // 3) تقسيم المحتوى إلى جُمل (تقريبية) وحساب درجة تطابق لكل جملة
+  const sentenceDelim = /(?<=[\.\!\?؟…])\s+/g; // يحافظ على العلامة داخل الجملة
+  const rawSentences = clean.split(sentenceDelim).map(s=>s.trim()).filter(Boolean);
+  interface ScoredSentence { idx: number; text: string; score: number; firstPos: number; }
+  const scored: ScoredSentence[] = rawSentences.map((text, idx) => {
+    let score = 0; let firstPos = -1;
+    const lower = text.toLowerCase();
+    for (const t of qTokens) {
+      const p = lower.indexOf(t.toLowerCase());
+      if (p !== -1) {
+        score += 1; // وزن بسيط لكل ظهور كلمة
+        if (firstPos === -1 || p < firstPos) firstPos = p;
+      }
+    }
+    return { idx, text, score, firstPos: firstPos === -1 ? 9_999_999 : firstPos };
+  });
+  // اختر الجملة ذات أعلى score ثم الأقرب (أصغر firstPos) ثم الأقصر.
+  scored.sort((a,b)=>{
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.firstPos !== b.firstPos) return a.firstPos - b.firstPos;
+    return a.text.length - b.text.length;
+  });
+  const best = scored.find(s=>s.score>0) || null;
+
+  if (best) {
+    // حاول ضم الجملة السابقة أو اللاحقة لو احتجنا سياق ولم نتخطى maxChars
+    let snippet = best.text;
+    if (snippet.length < maxChars * 0.6) {
+      const prev = rawSentences[best.idx - 1];
+      const next = rawSentences[best.idx + 1];
+      if (prev && (snippet.length + prev.length + 3) <= maxChars) snippet = prev + ' ' + snippet;
+      if (next && (snippet.length + next.length + 3) <= maxChars) snippet = snippet + ' ' + next;
+    }
+    if (snippet.length > maxChars) snippet = snippet.slice(0, maxChars - 1) + '…';
+    return snippet.trim();
+  }
+
+  // 4) fallback: نافذة حول أول تطابق لأي كلمة (المنطق القديم مُحسّن)
+  let bestIndex = -1; let tokenMatched = '';
+  for (const t of qTokens) {
+    const idx = lowerClean.indexOf(t.toLowerCase());
+    if (idx !== -1 && (bestIndex === -1 || idx < bestIndex)) { bestIndex = idx; tokenMatched = t; }
+  }
+  if (bestIndex !== -1) {
+    const half = Math.max(60, Math.floor(maxChars/2));
+    const start = Math.max(0, bestIndex - half);
+    const end = Math.min(clean.length, bestIndex + half);
+    const slice = clean.slice(start, end).trim();
+    const prefix = start > 0 ? '…' : '';
+    const suffix = end < clean.length ? '…' : '';
+    const windowSnippet = (prefix + slice + suffix).slice(0, maxChars + 2);
+    // لو النافذة لا تحتوي فعلياً الكلمة التي طابقت (بسبب قص) أضف تأكيد
+    if (!windowSnippet.toLowerCase().includes(tokenMatched.toLowerCase())) {
+      return windowSnippet.slice(0, maxChars - 1) + '…';
+    }
+    return windowSnippet;
+  }
+
+  // 5) fallback نهائي: أول maxChars
+  return clean.slice(0, maxChars - 1) + '…';
+}
+
+/**
+ * تطبيق القص على الحقول قبل الإرجاع حتى لا نعرض كامل اليوميات.
+ * - يعدل hits و answers داخل الـ payload (نسخة جديدة) ويضيف sources مختصرة.
+ */
+function applyAnswerSnippets(payload: any, hits: any[], question: string) {
+  try {
+    if (!payload || !Array.isArray(hits) || !hits.length) return payload;
+    // Build quick lookup for candidate evidence (from answer selector JSON)
+    const candidateMap: Record<string, any> = {};
+    const answerIds = new Set<string>();
+    if (Array.isArray(payload?.candidates)) {
+      for (const c of payload.candidates) {
+        if (c && typeof c.id !== 'undefined') candidateMap[String(c.id)] = c;
+      }
+    }
+    if (Array.isArray(payload?.answers)) {
+      for (const a of payload.answers) answerIds.add(String(a.id));
+    }
+
+    // Utility: refine raw evidence snippet into a very short (<= ~5 words) phrase
+    function refineSnippet(raw: string, q: string, maxWords = 5): string {
+      if (!raw) return '';
+      let s = String(raw).replace(/["'«»“”]/g, '').trim();
+      // Collapse whitespace
+      s = s.replace(/\s+/g, ' ');
+      // Try to detect a pencil-breaking like phrase (Arabic/English examples)
+      const pencilRegexes: RegExp[] = [
+        /(كسرت?\s+قلمي[^\n\r\.]*)/i,
+        /(كسر\s+القلم[^\n\r\.]*)/i,
+        /(انكسر\s+القلم[^\n\r\.]*)/i,
+        /((broke|broken|break)\s+(my\s+)?pencil[^\n\r\.]*)/i,
+      ];
+      for (const rx of pencilRegexes) {
+        const m = s.match(rx);
+        if (m && m[1]) { s = m[1].trim(); break; }
+      }
+      // Token based trimming around question keywords
+      const qTokens = (q || '').split(/\s+/).filter(t => t.length > 2);
+      const stop = new Set(['the','and','ثم','لكن','هذا','هذه','كان','كانت','الى','على','من','في','with','that','for']);
+      const keywords = qTokens.filter(t=>!stop.has(t.toLowerCase())).slice(0,4);
+      const words = s.split(/\s+/);
+      if (words.length <= maxWords) return words.join(' ');
+      // Prefer a window containing any keyword
+      let bestIdx = -1;
+      for (let i=0;i<words.length;i++) {
+        const wToken = words[i];
+        if (!wToken) continue;
+        const wLower = wToken.toLowerCase();
+        if (keywords.some(k => wLower.includes(k.toLowerCase()))) { bestIdx = i; break; }
+      }
+      if (bestIdx !== -1) {
+        const start = Math.max(0, bestIdx - 2);
+        const slice = words.slice(start, start + maxWords);
+        return slice.join(' ');
+      }
+      // Fallback: first N words
+      return words.slice(0, maxWords).join(' ');
+    }
+
+    const modifiedHits = hits.map((h:any)=>{
+      const hi = (h as any).highlight || {};
+      const hiContent = Array.isArray(hi.content) && hi.content[0] ? hi.content[0] : null;
+      const baseExtracted = extractSnippet(String(h?._source?.content||''), question, hiContent);
+      let snippet = baseExtracted;
+      const cand = candidateMap[String(h._id)];
+      // If this hit was part of selected answers (higher privacy), try its evidence snippet
+      if (cand && answerIds.has(String(h._id)) && cand.evidence && Array.isArray(cand.evidence.snippets) && cand.evidence.snippets.length) {
+        const evidRaw = String(cand.evidence.snippets[0] || '').trim();
+        if (evidRaw) snippet = refineSnippet(evidRaw, question);
+      } else {
+        // Otherwise still try to reduce large snippet to a concise phrase
+        snippet = refineSnippet(snippet, question);
+      }
+      // Build snippet parts for highlighting keywords
+      const qTokens = (question||'').split(/\s+/).filter(t=>t.length>2);
+      const stop = new Set(['the','and','ثم','لكن','هذا','هذه','كان','كانت','الى','على','من','في','with','that','for']);
+      const keywords = qTokens.filter(t=>!stop.has(t.toLowerCase()));
+      const parts: { text: string; h: boolean }[] = [];
+      const words = snippet.split(/(\s+)/); // keep spaces tokens
+      for (const w of words) {
+        if (/^\s+$/.test(w)) { parts.push({ text: w, h: false }); continue; }
+        const wl = w.toLowerCase();
+        const hit = keywords.some(k=> wl.includes(k.toLowerCase()));
+        parts.push({ text: w, h: hit });
+      }
+      return {
+        ...h,
+        _source: {
+          ...h._source,
+          snippet,
+          snippet_parts: parts,
+          truncated: true,
+          original_length: String(h?._source?.content||'').length,
+          content: snippet
+        }
+      };
+    });
+    // تحديث answers بإضافة snippet
+    const answers = (Array.isArray(payload.answers)?payload.answers:[]).map((a:any)=>{
+      if (a.snippet) return a;
+      const hit = modifiedHits.find((h:any)=>String(h._id)===String(a.id));
+  if (hit?._source?.snippet) return { ...a, snippet: hit._source.snippet, snippet_parts: hit._source.snippet_parts };
+      return a;
+    });
+    // إنشاء sources بمعلومات أكثر وضوحاً
+    const sources = answers.map((a:any)=>{
+      const hit = modifiedHits.find((h:any)=>String(h._id)===String(a.id));
+      const sourceTitle = hit?._source?.title || 'مذكرة بدون عنوان';
+      const snippet = a.snippet || '';
+      const snippet_parts = (hit?._source?.snippet_parts)||a.snippet_parts||null;
+      // استخدام العنوان أو جزء من المحتوى بدلاً من المعرف التقني
+      const displayId = sourceTitle.length > 50 ? sourceTitle.slice(0, 50) + '...' : sourceTitle;
+      return { 
+        id: a.id, 
+        displayId, 
+        title: sourceTitle,
+        snippet: snippet || '',
+        snippet_parts,
+        truncated: hit?._source?.truncated || false
+      };
+    });
+    return { ...payload, answers, sources, hits: modifiedHits };
+  } catch {
+    return payload;
+  }
+}
 
 /**
  * ===============================
@@ -152,6 +425,40 @@ search.get(
 search.post(
   "/api/search/diary/answer",
   async (req: Request, res: Response, next: NextFunction) => {
+    // Attach a stable classification so the frontend doesn't infer incorrectly.
+    function classify(payload: any) {
+      try {
+        if (!payload) return payload;
+        const finalObj = (payload.final || {}) as any;
+        const finalType = typeof finalObj.type === 'string' ? finalObj.type.toLowerCase() : 'none';
+        const finalText = String(finalObj.text || '').trim();
+        const answersArr: any[] = Array.isArray(payload.answers) ? payload.answers : [];
+        const candidatesArr: any[] = Array.isArray(payload.candidates) ? payload.candidates : [];
+        const hasYesCandidate = candidatesArr.some((c: any) => (c?.verdict || '').toLowerCase() === 'yes');
+        const hasNoCandidate = candidatesArr.some((c: any) => (c?.verdict || '').toLowerCase() === 'no');
+        const waiting = !!payload?.meta?.waiting;
+        let classification: 'pending' | 'yes' | 'no' | 'none' = 'none';
+        let reason_code = 'none';
+        if (waiting) {
+          classification = 'pending';
+          reason_code = 'waiting_consent';
+        } else if (finalType === 'none') {
+          if (/في انتظار الموافقة/i.test(finalText)) { classification='pending'; reason_code='waiting_consent'; }
+          else if (/i don't know|لا أعرف/i.test(finalText)) { classification='none'; reason_code='unknown'; }
+          else if (/لم يتم العثور/i.test(finalText)) { classification='no'; reason_code='no_results'; }
+          else if (hasYesCandidate) { classification='yes'; reason_code='masked_yes_privacy'; }
+          else if (hasNoCandidate) { classification='no'; reason_code='llm_no'; }
+        } else { // finalType !== none
+          if (hasYesCandidate || answersArr.length>0) { classification='yes'; reason_code = hasYesCandidate? 'llm_yes':'answer_text_yes'; }
+          else if (hasNoCandidate) { classification='no'; reason_code='llm_no'; }
+          else if (/^no\b|\bno\b|^لا\b/i.test(finalText.toLowerCase())) { classification='no'; reason_code='direct_text_no'; }
+          else { classification='yes'; reason_code='direct_text_yes'; }
+        }
+        const matched = classification==='yes';
+        payload.meta = { ...(payload.meta||{}), classification, matched, reason_code, has_yes_candidate: hasYesCandidate };
+      } catch {}
+      return payload;
+    }
     // Helper: normalize selector result to avoid consent if there's no explicit YES evidence
     function normalizeSelectorResult(r: any) {
       // Do not override LLM decisions. Only normalize formatting for the none case.
@@ -179,10 +486,11 @@ search.post(
   const authUser = (req as any).user?.sub || null;
   const userIdFromHeader = (req.get('x-user-id') || '').trim() || null;
   const userId: string | null = authUser || userIdFromHeader || (body.userId ? String(body.userId) : null);
+  const debug = body.debug === true || body.debug === '1' || req.query.debug === '1' || process.env.ANSWER_DEBUG === '1';
 
       if (!question) return res.status(400).json({ error: "question is required" });
 
-      let topHits: any[];
+  let topHits: any[];
       if (hits && hits.length) {
         topHits = hits.slice(0, 10);
       } else {
@@ -196,6 +504,72 @@ search.post(
           all = all.filter((h: any) => String(h?._source?.userId || '') !== String(userId));
         }
         topHits = (all || []).slice(0, 10);
+      }
+
+      // DEBUG SHORT-CIRCUIT: إذا فعلنا وضع التصحيح نتجنب إستدعاء الـ LLM لإظهار المخرج فورًا
+      if (debug) {
+        const simpleCandidates = (topHits || []).map((h: any) => {
+          const id = String(h?._id || '');
+          const content = String(h?._source?.content || '').toLowerCase();
+          // بدائية: علامة yes إذا وُجدت أي كلمة من السؤال داخل المحتوى
+          const qTokens = question.split(/\s+/).filter(Boolean);
+            const match = qTokens.some(t => content.includes(t.toLowerCase()));
+          return {
+            id,
+            verdict: match ? 'yes' : 'no',
+            evidence: {
+              fields: ['content'],
+              snippets: match ? [content.slice(0, 160)] : []
+            }
+          };
+        });
+        const yesCandidates = simpleCandidates.filter(c => c.verdict === 'yes');
+        const answers = yesCandidates.slice(0,1).map(c => ({ id: c.id, snippet: c.evidence.snippets[0] || '' }));
+        const payload = {
+          question,
+          considered_count: (topHits || []).length,
+          candidates: simpleCandidates,
+          answers,
+          final: yesCandidates.length ? { type: 'answer', text: 'نعم (debug).' } : { type: 'none', text: 'لا أعرف (debug)' },
+          meta: { debug: true, waiting: false, scope, mode, method }
+        } as any;
+        classify(payload);
+  const withSnips = applyAnswerSnippets(payload, topHits, question);
+  return res.json(withSnips);
+      }
+
+      // For scope 'others': if no results found, return "لا أعرف" directly
+      // If results exist, proceed with normal flow to request consent
+      if (scope === 'others' && (!topHits || topHits.length === 0)) {
+        const genericResult = {
+          question,
+          final: { type: 'none', text: 'لا أعرف' },
+          answers: [],
+          candidates: [],
+          meta: { method, waiting: false, scope: 'others', privacy_protected: true }
+        };
+  classify(genericResult);
+  // لا يوجد hits هنا أو فارغة
+        
+        try {
+          await ensureSearchHistoryTable();
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
+          await insertHistory({
+            id,
+            userId: String(userId || authUser || 'anon'),
+            source: 'diary',
+            query: question,
+            mode,
+            scope,
+            method: method ?? null,
+            requestId: null,
+            status: 'DONE',
+            hits: topHits || [],
+            answer: genericResult,
+          });
+        } catch {}
+        
+        return res.json(genericResult);
       }
 
   const resultRaw = await selectAnswer(question, topHits, { temperature: 0 });
@@ -213,6 +587,36 @@ search.post(
   const hasYesCandidate = candidatesArr.some((c: any) => (c?.verdict || '').toLowerCase() === 'yes');
   // Extra safety: treat explicit "I don't know" as unknown even if the type is inconsistent
   const isUnknown = finalType === 'none' || finalText.toLowerCase() === "i don't know";
+
+  // Additional privacy protection for scope 'others': 
+  // Even if LLM finds answers, don't show detailed responses, proceed with consent flow
+  if (scope === 'others' && !isUnknown && answersArr.length > 0) {
+    // Check if all answer sources are from others (not from requester)
+    const idOf = (h: any): string => String((h && (h._id || h?.id || (h?._source?.id))) || '');
+    const hitsById = new Map<string, any>((topHits || []).map((h: any) => [idOf(h), h]));
+    const hasOwnAnswers = answersArr.some((a: any) => {
+      const h = hitsById.get(String(a?.id || ''));
+      return h && String(h?._source?.userId || '') === String(userId);
+    });
+    
+    // If no own answers found, this means answers are from others only
+    // Don't reveal detailed answers, proceed with consent flow instead
+    if (!hasOwnAnswers) {
+      // Check if there are actually any 'yes' candidates (meaning useful results exist)
+      const hasUsefulResults = candidatesArr.some((c: any) => (c?.verdict || '').toLowerCase() === 'yes');
+      
+      if (hasUsefulResults) {
+        // Override the final answer to not reveal details
+        (result as any).final = { type: 'none', text: 'تم العثور على نتائج - في انتظار الموافقة' };
+        // Mark as unknown to proceed with consent flow
+        // But we need to reset isUnknown logic since we want consent flow, not immediate "I don't know"
+      } else {
+        // No useful results found, return "لم يتم العثور على نتائج"
+        (result as any).final = { type: 'none', text: 'لم يتم العثور على نتائج' };
+      }
+    }
+  }
+
       const requesterId = userId ? String(userId) : null;
       const hasOthers = (topHits || []).some((h: any) => requesterId && String(h?._source?.userId || '') !== requesterId);
 
@@ -232,6 +636,9 @@ search.post(
           const filteredCandidates = (candidatesArr || []).filter((c: any) => ownAnswerIds.has(String(c?.id || '')));
           const filteredAnswers = (answersArr || []).filter((a: any) => ownAnswerIds.has(String(a?.id || '')));
           const directPayload = { ...result, candidates: filteredCandidates, answers: filteredAnswers, meta: { ...(result as any).meta, method, waiting: false } } as any;
+          classify(directPayload);
+          // تأكد من قص المحتوى حتى في حالة الإجابة المباشرة (وثائق المستخدم نفسه)
+          const directWithSnips = applyAnswerSnippets(directPayload, topHits, question);
           try {
             await ensureSearchHistoryTable();
             const id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
@@ -249,13 +656,15 @@ search.post(
               answer: directPayload,
             });
           } catch {}
-          return res.json(directPayload);
+          return res.json(directWithSnips);
         }
       }
 
       // Hard stop: if unknown, immediately return with waiting=false and never create consent requests/notifications
       if (isUnknown) {
         const safeResult = { ...result, final: { type: 'none', text: "I don't know" }, meta: { ...(result as any).meta, method, waiting: false } } as any;
+  classify(safeResult);
+  const safeWithSnippets = applyAnswerSnippets(safeResult, topHits, question);
         // Log as DONE
         try {
           await ensureSearchHistoryTable();
@@ -274,7 +683,7 @@ search.post(
             answer: safeResult,
           });
         } catch {}
-        return res.json(safeResult);
+  return res.json(safeWithSnippets);
       }
 
       if (!isUnknown && hasOthers && requesterId) {
@@ -329,7 +738,7 @@ search.post(
                   userId: ownerId,
                   type: 'CONSENT_REQUEST',
                   requestId: request.id,
-                  message: 'هناك من يريد الإطلاع على يوميتك ضمن نتائج البحث، هل ترغب بالسماح بذلك؟'
+                  message: `شخص ما يبحث عن: "${question}" - ونعتقد أن لديك معلومات مفيدة في يومياتك. هل تسمح بمشاركة النتائج المتطابقة؟`
                 })
               )
             );
@@ -339,10 +748,12 @@ search.post(
               considered_count: (topHits || []).length,
               candidates: [],
               answers: [],
-              // Do not leak a pseudo-answer string; UI should rely on meta.waiting
-              final: { type: 'none', text: '' },
+              // Show helpful message while waiting for consent
+              final: { type: 'none', text: 'تم العثور على نتائج - في انتظار الموافقة' },
               meta: { ...(result as any).meta, waiting: true, requestId: request.id, method },
             };
+            classify(waitingPayload);
+            const waitingWithSnips = applyAnswerSnippets(waitingPayload, topHits, question);
             // Log to search history as WAITING
             try {
               await ensureSearchHistoryTable();
@@ -361,7 +772,7 @@ search.post(
                 answer: null,
               });
             } catch {}
-            return res.json(waitingPayload);
+            return res.json(waitingWithSnips);
           }
           // No valid candidates found; fall through to return direct result without waiting
         } catch {
@@ -389,6 +800,8 @@ search.post(
           }
         }
         const withMethod = { ...result, final: finalFixed, meta: { ...(result as any).meta, method, waiting: false } };
+  classify(withMethod);
+  const withSnippets = applyAnswerSnippets(withMethod, topHits, question);
         // Log as DONE (own docs only or unknown)
         try {
           await ensureSearchHistoryTable();
@@ -407,7 +820,7 @@ search.post(
             answer: withMethod,
           });
         } catch {}
-  return res.json(withMethod);
+  return res.json(withSnippets);
       } catch {
   return res.json({ ...result, meta: { ...(result as any).meta, method, waiting: false } });
       }
@@ -658,10 +1071,22 @@ search.get(
             const ownerId = String(h?._source?.userId || '');
             return ownerId === String(r.requesterId) || (approvedUserId && ownerId === approvedUserId);
           });
+          // Apply snippet truncation to filtered results
+          const reduced = reduceHits(filtered, Number(process.env.SEARCH_TOP_LIMIT_DEFAULT) || 5);
+          const trimmed = reduced.map((h:any)=>{
+            try {
+              if (h?._source?.redacted) return h; // keep redacted minimal
+              const srcContent = String(h?._source?.content||'');
+              const hi = (h as any).highlight || {};
+              const hiContent = Array.isArray(hi.content) && hi.content[0] ? hi.content[0] : null;
+              const snippet = extractSnippet(srcContent, r.query, hiContent);
+              return { ...h, _source: { ...h._source, snippet, content: snippet, truncated: true, original_length: srcContent.length } };
+            } catch { return h; }
+          });
           // Compute answer now if possible
           let computedAnswer: any = null;
           try {
-            const top = filtered.slice(0, 10);
+            const top = trimmed.slice(0, 10);
             if (top.length) computedAnswer = await selectAnswer(r.query, top, { temperature: 0 });
           } catch {}
           await upsertSnapshot({
@@ -673,14 +1098,14 @@ search.get(
             scope: 'all',
             approvedCandidateUserId: approvedUserId,
             isApproved: true,
-            hits: filtered,
+            hits: trimmed,
             answer: computedAnswer ?? ((snap as any).answer ? (typeof (snap as any).answer === 'string' ? JSON.parse((snap as any).answer) : (snap as any).answer) : null),
           });
           // Update search history (WAITING -> DONE) by requestId
           try {
-            await updateHistoryByRequestId(r.id, { status: 'DONE', hits: filtered, answer: computedAnswer ?? ((snap as any).answer ?? null) });
+            await updateHistoryByRequestId(r.id, { status: 'DONE', hits: trimmed, answer: computedAnswer ?? ((snap as any).answer ?? null) });
           } catch {}
-          return res.json({ requestId: r.id, query: r.query, mode, scope: 'all', isApproved: true, approvedCandidateUserId: approvedUserId, hits: filtered, answer: computedAnswer ?? ((snap as any).answer ?? null) });
+          return res.json({ requestId: r.id, query: r.query, mode, scope: 'all', isApproved: true, approvedCandidateUserId: approvedUserId, hits: trimmed, answer: computedAnswer ?? ((snap as any).answer ?? null) });
         }
         // If snapshot has hits but answer is missing, compute it now
         let answerVal = typeof (snap as any).answer === 'string' ? JSON.parse((snap as any).answer) : ((snap as any).answer || null);
@@ -736,6 +1161,19 @@ search.get(
         return ownerId === String(r.requesterId) || (approvedUserId && ownerId === approvedUserId);
       });
 
+      // Apply snippet truncation to results  
+      const reduced = reduceHits(filtered, Number(process.env.SEARCH_TOP_LIMIT_DEFAULT) || 5);
+      const trimmed = reduced.map((h:any)=>{
+        try {
+          if (h?._source?.redacted) return h; // keep redacted minimal
+          const srcContent = String(h?._source?.content||'');
+          const hi = (h as any).highlight || {};
+          const hiContent = Array.isArray(hi.content) && hi.content[0] ? hi.content[0] : null;
+          const snippet = extractSnippet(srcContent, r.query, hiContent);
+          return { ...h, _source: { ...h._source, snippet, content: snippet, truncated: true, original_length: srcContent.length } };
+        } catch { return h; }
+      });
+
   const payload = {
         id: r.id,
         requestId: r.id,
@@ -745,12 +1183,12 @@ search.get(
         scope: 'all' as const,
         approvedCandidateUserId: approvedUserId,
         isApproved: true,
-        hits: filtered,
+        hits: trimmed,
         answer: null,
       };
       await upsertSnapshot(payload);
-  try { await updateHistoryByRequestId(r.id, { status: 'DONE', hits: filtered, answer: null }); } catch {}
-      return res.json({ requestId: r.id, query: r.query, mode, scope: 'all', isApproved: true, approvedCandidateUserId: approvedUserId, hits: filtered, answer: null });
+  try { await updateHistoryByRequestId(r.id, { status: 'DONE', hits: trimmed, answer: null }); } catch {}
+      return res.json({ requestId: r.id, query: r.query, mode, scope: 'all', isApproved: true, approvedCandidateUserId: approvedUserId, hits: trimmed, answer: null });
     } catch (err) { next(err); }
   }
 );
@@ -869,14 +1307,14 @@ search.post(
   "/api/search/chat/answer",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const body = req.body || {};
-      const question = String(body.question ?? "").trim();
-      const modeParam = String(body.mode ?? "").toLowerCase();
-      const mode: "wide" | "strict" = modeParam === "strict" ? "strict" : "wide";
-      const hitsIn = Array.isArray(body.hits) ? body.hits : undefined;
-      if (!question) return res.status(400).json({ error: "question is required" });
-      const hits = hitsIn?.length ? hitsIn.slice(0, 10) : await searchChatsSemantic(question, { mode });
-      const result = await selectAnswer(question, hits, { temperature: 0 });
+  const body = req.body || {};
+  const question = String(body.question ?? "").trim();
+  const modeParam = String(body.mode ?? "").toLowerCase();
+  const mode: "wide" | "strict" = modeParam === "strict" ? "strict" : "wide";
+  const hitsIn = Array.isArray(body.hits) ? body.hits : undefined;
+  if (!question) return res.status(400).json({ error: "question is required" });
+  const hits = hitsIn?.length ? hitsIn.slice(0, 10) : await searchChatsSemantic(question, { mode });
+  const result = await selectAnswer(question, hits, { temperature: 0 });
       // Log history (DONE)
       try {
         await ensureSearchHistoryTable();

@@ -2,8 +2,128 @@
 import { es } from "../lib/es";
 import { DIARY_INDEX } from "./diaryIndex";
 import { embedText } from "../services/embeddings";
-import { expandQuery } from "../services/keywordExtractor"; // returns ClauseGraphPayload (+ optional en_simple)
-import { logQueryExpansion } from "../services/queryLog";   // analysis-only logging
+import { expandQuery, DEFAULT_LLM_MODEL } from "../services/keywordExtractor"; 
+import { logQueryExpansion } from "../services/queryLog";   
+import { searchChunkedDiaries } from "../services/diaryChunkedIndexing";
+
+// ------------------------------------------------------------
+// Environment / Config Helpers
+// ------------------------------------------------------------
+const envBool = (name: string, def = false) => {
+  const v = process.env[name];
+  if (v == null) return def;
+  return /^(1|true|yes|on)$/i.test(v.trim());
+};
+const envInt = (name: string, def: number) => {
+  const v = process.env[name];
+  const n = v ? parseInt(v, 10) : NaN;
+  return Number.isFinite(n) ? n : def;
+};
+
+// Feature toggles & tunables (safe defaults)
+const CFG_PHASED = envBool("SEARCH_PHASED", true); // enable phased lexical gate
+const CFG_LEXICAL_THRESHOLD = envInt("SEARCH_LEXICAL_HIT_THRESHOLD", 3); // hits needed to skip expansion
+const CFG_DISABLE_EXP_FOR_SHORT = envBool("SEARCH_DISABLE_EXPANSION_FOR_SHORT", true);
+const CFG_SHORT_QUERY_MAX_TOKENS = envInt("SEARCH_SHORT_QUERY_MAX_TOKENS", 3);
+const CFG_EMBED_CACHE_SIZE = envInt("SEARCH_EMBED_CACHE_SIZE", 256);
+const CFG_EXPAND_CACHE_SIZE = envInt("SEARCH_EXPAND_CACHE_SIZE", 256);
+const CFG_CACHE_TTL_MS = envInt("SEARCH_CACHE_TTL_MS", 5 * 60 * 1000); // 5m
+
+// ------------------------------------------------------------
+// Simple LRU Cache implementation (time-aware)
+// ------------------------------------------------------------
+interface LRUEntry<T> { value: T; expires: number; }
+class LRUCache<T> {
+  private map = new Map<string, LRUEntry<T>>();
+  constructor(private capacity: number, private ttlMs: number) {}
+  get(key: string): T | undefined {
+    const e = this.map.get(key);
+    if (!e) return undefined;
+    if (e.expires < Date.now()) { this.map.delete(key); return undefined; }
+    // refresh recency
+    this.map.delete(key); this.map.set(key, e);
+    return e.value;
+  }
+  set(key: string, value: T) {
+    if (this.capacity <= 0) return;
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, { value, expires: Date.now() + this.ttlMs });
+    if (this.map.size > this.capacity) {
+      // delete oldest
+      const first = this.map.keys().next();
+      if (!first.done) this.map.delete(first.value);
+    }
+  }
+  size() { return this.map.size; }
+}
+
+// Caches
+const embedCache = new LRUCache<number[]>(CFG_EMBED_CACHE_SIZE, CFG_CACHE_TTL_MS);
+const expandCache = new LRUCache<any>(CFG_EXPAND_CACHE_SIZE, CFG_CACHE_TTL_MS);
+
+// Metrics (lightweight, in-memory)
+let METRIC_EMBED_CACHE_HIT = 0;
+let METRIC_EXPAND_CACHE_HIT = 0;
+let METRIC_EXPANSIONS_SKIPPED_SHORT = 0;
+let METRIC_PHASED_LEXICAL_BYPASS = 0;
+let METRIC_PHASED_LEXICAL_ATTEMPTS = 0;
+
+function maybeLogMetrics() {
+  // Log every ~200 queries (heuristic based on sum of events)
+  const total = METRIC_EMBED_CACHE_HIT + METRIC_EXPAND_CACHE_HIT + METRIC_PHASED_LEXICAL_ATTEMPTS;
+  if (total % 200 === 0 && total !== 0) {
+    console.info("[DiarySearch][metrics]", {
+      embedCacheHit: METRIC_EMBED_CACHE_HIT,
+      expandCacheHit: METRIC_EXPAND_CACHE_HIT,
+      expansionsSkippedShort: METRIC_EXPANSIONS_SKIPPED_SHORT,
+      phasedLexicalBypass: METRIC_PHASED_LEXICAL_BYPASS,
+      embedCacheSize: embedCache.size(),
+      expandCacheSize: expandCache.size()
+    });
+  }
+}
+
+async function getEmbedding(q: string): Promise<number[]> {
+  const key = q.trim();
+  const cached = embedCache.get(key);
+  if (cached) { METRIC_EMBED_CACHE_HIT++; maybeLogMetrics(); return cached; }
+  const vec = await embedText(q);
+  if (Array.isArray(vec)) embedCache.set(key, vec);
+  maybeLogMetrics();
+  return vec;
+}
+
+async function getExpanded(q: string): Promise<any> {
+  const model = DEFAULT_LLM_MODEL;
+  const key = model + "|" + q.trim().toLowerCase();
+  const cached = expandCache.get(key);
+  if (cached) { METRIC_EXPAND_CACHE_HIT++; maybeLogMetrics(); return cached; }
+  const expanded = await expandQuery(q, { model, temperature: 0.1 });
+  expandCache.set(key, expanded);
+  maybeLogMetrics();
+  return expanded;
+}
+
+// Cheap lexical token counter (split by whitespace)
+function countQueryTokens(q: string): number { return q.trim().split(/\s+/).filter(Boolean).length; }
+
+// Lightweight lexical multi_match for phased gate or short-query path
+function buildSimpleLexicalQuery(userQuery: string) {
+  return {
+    bool: {
+      must: [
+        {
+          multi_match: {
+            query: userQuery,
+            fields: ["title^3", "content^2", "phrases_en", "inquiry_en"],
+            type: "best_fields",
+            fuzziness: "AUTO"
+          }
+        }
+      ]
+    }
+  };
+}
 
 type SearchHit<T = any> = {
   _id: string;
@@ -12,83 +132,13 @@ type SearchHit<T = any> = {
   highlight?: Record<string, string[]>;
 };
 
-// -------------------- helpers (typed for strings) --------------------
+// Helper functions
 const toStr = (s?: unknown) => (s ?? "").toString().trim();
-const low  = (s?: string) => toStr(s).toLowerCase();
-
+const low = (s?: string) => toStr(s).toLowerCase();
 const ensureStrArray = (x: unknown): string[] =>
   Array.isArray(x) ? (x as unknown[]).map((v) => toStr(v)).filter(Boolean) : [];
-
 const uniqStr = (arr: ReadonlyArray<string>): string[] => Array.from(new Set(arr));
 
-/** Tokenize a string to lowercase word tokens (ASCII letters + apostrophes) */
-function getWordTokens(s: string): string[] {
-  return (s.toLowerCase().match(/[a-z']+/g) ?? []).filter(Boolean);
-}
-
-/** Load English stopwords from env STOPWORDS_EN (JSON array of strings) */
-function getStopwordSet(): Set<string> {
-  const raw = process.env.STOPWORDS_EN;
-  if (!raw) return new Set<string>();
-  try {
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)) {
-      const out = new Set<string>();
-      for (const v of arr) if (typeof v === "string") out.add(v.toLowerCase());
-      return out;
-    }
-  } catch {
-    // ignore invalid JSON
-  }
-  return new Set<string>();
-}
-
-/** Load misspellings map from environment (JSON). Example: {"futbal":"football","dont":"don't"} */
-function getMisspellingsMap(): Record<string, string> {
-  const raw = process.env.MISSPELLINGS_MAP;
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      const out: Record<string, string> = {};
-      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof k === "string" && typeof v === "string") {
-          out[k.toLowerCase()] = v.toLowerCase();
-        }
-      }
-      return out;
-    }
-  } catch {
-    // ignore invalid JSON and fall back to empty map
-  }
-  return {};
-}
-
-/** Detect negation (EN; supports curly/straight apostrophes) */
-function isNegatedText(q: string): boolean {
-  const negEN =
-    /\b(?:not|no|never|didn[’']t|don[’']t|doesn[’']t|without|failed?\s+to|avoid(?:ed|ing)?|miss(?:ed|ing)?)\b/i;
-  return negEN.test(q);
-}
-
-function hasOverlap(a: Set<string>, b: Set<string>): boolean {
-  for (const v of a) if (b.has(v)) return true;
-  return false;
-}
-
-/** Minimal common misspelling normalization for high-impact tokens */
-function getNormalizedTokens(q: string): string[] {
-  const misspellingsMap = getMisspellingsMap();
-  const toks = (q.toLowerCase().match(/[a-z']+/g) ?? []).filter(Boolean);
-  const out = new Set<string>();
-  for (const t of toks) {
-    const norm = misspellingsMap[t];
-    if (norm) out.add(norm);
-  }
-  return Array.from(out);
-}
-
-/** Compact fallback text for fuzzy multi_match */
 function buildFallbackQuery(
   userQuery: string,
   spans: string[],
@@ -108,7 +158,6 @@ function buildFallbackQuery(
   return uniqStr(parts).slice(0, 24).join(" ");
 }
 
-/** Surface action tokens (lemma or surface) from event clauses */
 function getActionTokensFromClauses(payload: Awaited<ReturnType<typeof expandQuery>>): string[] {
   const out: string[] = [];
   for (const c of (payload as any).clauses ?? []) {
@@ -118,32 +167,6 @@ function getActionTokensFromClauses(payload: Awaited<ReturnType<typeof expandQue
   return uniqStr(out).filter(Boolean);
 }
 
-/** Extract infinitive verbs from control-verb patterns like "to <verb>" within objects/span */
-function getInfinitivesFromControlVerbs(payload: Awaited<ReturnType<typeof expandQuery>>): string[] {
-  const CONTROL = new Set([
-  "want", "try", "plan", "decide", "hope", "need", "like", "dislike", "avoid", "refuse", "intend", "promise", "agree", "prefer"
-  ]);
-  const toInf = (s?: string) => (s ?? "").toString().toLowerCase().trim();
-  const out = new Set<string>();
-  for (const c of (payload as any).clauses ?? []) {
-    if (c?.kind !== "event") continue;
-    const lemma = toInf(c.verb?.lemma || c.verb?.surface);
-    if (!lemma || !CONTROL.has(lemma)) continue;
-    // scan objects for "to <verb>"
-    for (const o of (c.objects ?? [])) {
-      const s = toInf(o);
-      const m = s.match(/\bto\s+([a-z]+)\b/);
-      if (m && m[1]) out.add(m[1]);
-    }
-    // scan source span as fallback
-    const span = toInf((c as any).source_span);
-    const m2 = span.match(/\bto\s+([a-z]+)\b/);
-    if (m2 && m2[1]) out.add(m2[1]);
-  }
-  return Array.from(out);
-}
-
-/** Exact source spans from event clauses */
 function getEventSpans(payload: Awaited<ReturnType<typeof expandQuery>>): string[] {
   const out: string[] = [];
   for (const c of (payload as any).clauses ?? []) {
@@ -154,359 +177,212 @@ function getEventSpans(payload: Awaited<ReturnType<typeof expandQuery>>): string
   return uniqStr(out);
 }
 
-/** Majority tense across events → coarse payload time */
-function selectTimeLabel(payload: Awaited<ReturnType<typeof expandQuery>>):
-  "past" | "present" | "future" | "unspecified" {
-  const counts: Record<"past" | "present" | "future" | "unspecified", number> =
-    { past: 0, present: 0, future: 0, unspecified: 0 };
-  for (const c of (payload as any).clauses ?? []) {
-    if (c?.kind !== "event") continue;
-    const t = (c.verb?.tense || "unspecified") as keyof typeof counts;
-    counts[t] = (counts[t] ?? 0) + 1;
-  }
-  const order: Array<keyof typeof counts> = ["past", "present", "future"];
-  let best: keyof typeof counts = "unspecified";
-  let bestCnt = 0;
-  for (const k of order) {
-    if (counts[k] > bestCnt) {
-      best = k; bestCnt = counts[k];
-    }
-  }
-  return bestCnt ? best : "unspecified";
-}
+/**
+ * Primary search function using chunked indexing
+ */
+export async function searchDiariesSemanticChunked(
+  userQuery: string,
+  opts: {
+    userId?: string;
+    mode?: "wide" | "strict";
+    scope?: "mine" | "others" | "all";
+    method?: "normal" | "vector" | "hybrid";
+    size?: number;
+    from?: number;
+  } = {}
+): Promise<SearchHit[]> {
+  if (!es) return [];
 
-/** Overall polarity from event-level negation flags (fallback to text) */
-function selectPolarity(
-  payload: Awaited<ReturnType<typeof expandQuery>>,
-  userQuery: string
-): "affirmative" | "negative" {
-  let neg = 0, pos = 0;
-  for (const c of (payload as any).clauses ?? []) {
-    if (c?.kind !== "event") continue;
-    if (c.verb?.negation) neg++; else pos++;
-  }
-  if (neg > 0 && pos === 0) return "negative";
-  if (pos > 0 && neg === 0) return "affirmative";
-  return isNegatedText(userQuery) ? "negative" : "affirmative";
-}
+  const { 
+    userId = "", 
+    mode = "wide", 
+    scope = "all", 
+    method = "normal",
+    size = 20,
+    from = 0
+  } = opts;
 
-/** Pull EN-simple expansions (typed) if available */
-function fromEnSimple(payload: any): {
-  entities: string[];
-  actions: string[];
-  phrases: string[];
-  entitySynonyms: string[];
-  actionSynonyms: string[];
-  paraphrases: string[];
-} {
-  const en = (payload?.en_simple ?? {}) as any;
+  if (!userQuery.trim()) return [];
 
-  const entities = ensureStrArray(en.entities).map(low);
-  const actions  = ensureStrArray(en.actions).map(low);
-  const phrases  = ensureStrArray(en.phrases_en).map(toStr);
-  const paraphrases = ensureStrArray(en.paraphrases).map(toStr);
-
-  const entitySynsSet = new Set<string>();
-  if (Array.isArray(en?.synsets?.entity_synsets)) {
-    for (const e of en.synsets.entity_synsets) {
-      const lemma = low((e?.lemma as string) ?? "");
-      if (lemma) entitySynsSet.add(lemma);
-      for (const s of ensureStrArray(e?.synonyms)) entitySynsSet.add(low(s));
-    }
-  }
-
-  const actionSynsSet = new Set<string>();
-  if (Array.isArray(en?.synsets?.action_synsets)) {
-    for (const a of en.synsets.action_synsets) {
-      const lemma = low((a?.lemma as string) ?? "");
-      if (lemma) actionSynsSet.add(lemma);
-      for (const s of ensureStrArray(a?.synonyms)) actionSynsSet.add(low(s));
-    }
-  }
-
-  return {
-    entities: uniqStr(entities),
-    actions: uniqStr(actions),
-    phrases: uniqStr(phrases),
-    entitySynonyms: Array.from(entitySynsSet),
-  actionSynonyms: Array.from(actionSynsSet),
-  paraphrases: uniqStr(paraphrases),
-  };
-}
-
-/** Main ES body (hybrid: kNN + lexical, English-only, w/ fuzziness) */
-function buildMainBody(args: {
-  qVec: number[];
-  entitiesQ: string[];
-  actionsQ: string[];
-  spansQ: string[];
-  paraQ: string[];
-  wantPol: "affirmative" | "negative";
-  payloadTime: "past" | "present" | "future" | "unspecified";
-  knnFilterMust: any[];
-  fallbackText: string;
-  rawQuery: string;
-}) {
-  const {
-    qVec, entitiesQ, actionsQ, spansQ, paraQ, wantPol, payloadTime, knnFilterMust, fallbackText, rawQuery,
-  } = args;
-
-  const must: any[] = [];
-  if (entitiesQ.length) {
-    must.push({
-      bool: {
-        should: [
-          { terms: { entities: entitiesQ } },
-          ...entitiesQ.map((e) => ({ match_phrase: { "content":    { query: e } } })),
-          ...entitiesQ.map((e) => ({ match_phrase: { "title":      { query: e } } })),
-          ...entitiesQ.map((e) => ({ match_phrase: { "phrases_en": { query: e } } })),
-        ],
-        minimum_should_match: 1,
-      },
-    });
-  }
-
-  const should: any[] = [];
-
-  if (actionsQ.length) {
-    should.push({ terms: { actions: actionsQ,      boost: 2.2 } });
-    should.push({ terms: { sensitive_en: actionsQ, boost: 1.8 } });
-
-    for (const a of actionsQ) {
-      should.push({ match_phrase: { "content": { query: a, boost: 2.2 } } });
-      should.push({ match_phrase: { "title":   { query: a, boost: 1.8 } } });
+  try {
+    // Build base query filters
+    const filters: any[] = [];
+    
+    if (scope === "mine" && userId) {
+      filters.push({ term: { userId } });
+    } else if (scope === "others" && userId) {
+      filters.push({
+        bool: {
+          must_not: [{ term: { userId } }]
+        }
+      });
     }
 
-    if (wantPol === "negative") {
-      should.push({ terms: { negated_actions_en: actionsQ,  boost: 2.0 } as any });
+    let query: any;
+
+    if (method === "vector") {
+      // Pure vector search (embedding cached)
+      const vec = await getEmbedding(userQuery);
+      query = {
+        bool: {
+          must: [
+            {
+              knn: {
+                field: "vec",
+                query_vector: vec,
+                k: size * 2,
+                num_candidates: 100,
+              }
+            }
+          ],
+          filter: filters
+        }
+      };
+    } else if (method === "hybrid") {
+      // Hybrid approach combining text and vector
+      const vec = await getEmbedding(userQuery);
+      query = {
+        bool: {
+          should: [
+            {
+              multi_match: {
+                query: userQuery,
+                fields: ["title^3", "content^2", "phrases_en", "inquiry_en"],
+                type: "best_fields",
+                fuzziness: "AUTO",
+              }
+            },
+            {
+              knn: {
+                field: "vec",
+                query_vector: vec,
+                k: size,
+                num_candidates: 50,
+                boost: 0.8
+              }
+            }
+          ],
+          minimum_should_match: 1,
+          filter: filters
+        }
+      };
     } else {
-      should.push({ terms: { affirmed_actions_en: actionsQ, boost: 2.0 } as any });
+      // Normal text search with phased lexical gate + optional expansion
+      let skipExpansion = false;
+      const tokenCount = countQueryTokens(userQuery);
+      if (CFG_DISABLE_EXP_FOR_SHORT && tokenCount <= CFG_SHORT_QUERY_MAX_TOKENS) {
+        skipExpansion = true;
+        METRIC_EXPANSIONS_SKIPPED_SHORT++;
+      }
+
+      // Phased lexical pre-check: cheap lexical query first; if it already yields >= threshold hits, skip expensive expansion
+      if (!skipExpansion && CFG_PHASED) {
+        METRIC_PHASED_LEXICAL_ATTEMPTS++;
+        try {
+          const lexicalGateQuery = buildSimpleLexicalQuery(userQuery);
+          const gateResult = await searchChunkedDiaries(lexicalGateQuery, {
+            size: CFG_LEXICAL_THRESHOLD,
+            from: 0,
+            aggregateChunks: true
+          });
+            if ((gateResult.hits?.length || 0) >= CFG_LEXICAL_THRESHOLD) {
+              skipExpansion = true;
+              METRIC_PHASED_LEXICAL_BYPASS++;
+              query = lexicalGateQuery; // reuse gate query (already good enough)
+            }
+        } catch (e) {
+          // Non-fatal
+          console.warn("[DiarySearch] lexical gate failed", e);
+        }
+      }
+
+      if (!skipExpansion) {
+        try {
+          const expanded = await getExpanded(userQuery);
+          await logQueryExpansion({ rawQuery: userQuery, payload: expanded, userId, mode });
+          const actions = getActionTokensFromClauses(expanded);
+          const entities = ensureStrArray((expanded as any).entities);
+          const spans = getEventSpans(expanded);
+
+          const textQuery = {
+            bool: {
+              should: [
+                {
+                  multi_match: {
+                    query: userQuery,
+                    fields: ["title^3", "content^2"],
+                    type: "best_fields",
+                    fuzziness: "AUTO",
+                    boost: 2.0
+                  }
+                },
+                ...(entities.length > 0 ? [{ terms: { entities, boost: 1.5 } }] : []),
+                ...(actions.length > 0 ? [{ terms: { actions, boost: 1.8 } }] : []),
+                ...(spans.length > 0 ? [{
+                  multi_match: {
+                    query: spans.join(" "),
+                    fields: ["phrases_en", "inquiry_en"],
+                    type: "phrase",
+                    boost: 1.3
+                  }
+                }] : []),
+                {
+                  multi_match: {
+                    query: buildFallbackQuery(userQuery, spans, actions, entities, []),
+                    fields: ["content", "title", "phrases_en"],
+                    type: "cross_fields",
+                    fuzziness: "AUTO",
+                    boost: 0.8
+                  }
+                }
+              ],
+              minimum_should_match: 1,
+              filter: filters
+            }
+          };
+          query = textQuery;
+        } catch (err) {
+          console.warn("[DiarySearch] Query expansion failed, falling back to simple search:", err);
+        }
+      }
+
+      if (!query) {
+        // Fallback simple lexical query (no expansion)
+        query = {
+          bool: {
+            must: [
+              {
+                multi_match: {
+                  query: userQuery,
+                  fields: ["title^3", "content^2", "phrases_en"],
+                  type: "best_fields",
+                  fuzziness: "AUTO"
+                }
+              }
+            ],
+            filter: filters
+          }
+        };
+      }
     }
-  }
 
-  for (const p of spansQ) {
-    should.push({ match_phrase: { "content":   { query: p, boost: 2.6 } } });
-    should.push({ match_phrase: { "phrases_en":{ query: p, boost: 1.6 } } });
-  }
-
-  // Add a light-weight paraphrase boost against content/title; keep it modest and capped
-  for (const p of paraQ.slice(0, 5)) {
-    should.push({ match_phrase: { "content": { query: p, boost: 1.2 } } });
-    should.push({ match_phrase: { "title":   { query: p, boost: 0.8 } } });
-  }
-
-  if (payloadTime !== "unspecified") {
-    should.push({ term: { time_label: { value: payloadTime, boost: 0.2 } } });
-  }
-  should.push({ term: { polarity: { value: wantPol, boost: 0.3 } } });
-
-  if (fallbackText) {
-    should.push({
-      multi_match: {
-        query: fallbackText,
-        fields: [
-          "title.std^1.8", "content.std^1.6",
-          "title.ascii^1.8","content.ascii^1.6",
-          "phrases_en^1.2",
-          "inquiry_en^1.2"
-        ],
-        type: "best_fields",
-        operator: "OR",
-        fuzziness: "AUTO",
-        minimum_should_match: "30%",
-      },
-    } as any);
-  }
-
-  // Direct fuzzy match on the original raw query to catch typos like 'futbal'
-  if (rawQuery?.trim()) {
-    should.push({ match: { "content.std":  { query: rawQuery, fuzziness: "AUTO", minimum_should_match: "15%", boost: 0.8 } } });
-    should.push({ match: { "content.ascii":{ query: rawQuery, fuzziness: "AUTO", minimum_should_match: "15%", boost: 0.6 } } });
-  should.push({ match: { "inquiry_en":   { query: rawQuery, fuzziness: "AUTO", minimum_should_match: "15%", boost: 0.6 } } });
-  }
-
-  for (const e of entitiesQ) {
-    should.push({ match: { "content.std":  { query: e, fuzziness: "AUTO", boost: 1.6 } } });
-    should.push({ match: { "content.ascii":{ query: e, fuzziness: "AUTO", boost: 1.4 } } });
-    should.push({ match: { "title.std":    { query: e, fuzziness: "AUTO", boost: 1.4 } } });
-  should.push({ match: { "inquiry_en":   { query: e, fuzziness: "AUTO", boost: 1.2 } } });
-  }
-  for (const a of actionsQ) {
-    should.push({ match: { "content.std":  { query: a, fuzziness: "AUTO", boost: 1.6 } } });
-    should.push({ match: { "content.ascii":{ query: a, fuzziness: "AUTO", boost: 1.4 } } });
-    should.push({ match: { "title.std":    { query: a, fuzziness: "AUTO", boost: 1.4 } } });
-  should.push({ match: { "inquiry_en":   { query: a, fuzziness: "AUTO", boost: 1.2 } } });
-  }
-
-  return {
-    min_score: 0.15,
-
-    knn: {
-      field: "vec",
-      query_vector: qVec,
-      k: 100,
-      num_candidates: 1000,
-      ...(knnFilterMust.length ? { filter: { bool: { must: knnFilterMust } } } : {}),
-    },
-
-    query: {
-      bool: {
-        must,
-        should,
-        minimum_should_match: should.length > 0 ? 1 : 0,
-      },
-    },
-
-    _source: [
-      "title",
-      "content",
-  "userId",
-      "entities",
-      "actions",
-      "sensitive_en",
-      "phrases_en",
-      "time_label",
-      "polarity",
-      "updatedAt",
-      "negated_actions_en",
-      "affirmed_actions_en",
-    ],
-
-    highlight: {
-      pre_tags: ["<mark>"],
-      post_tags: ["</mark>"],
-      fields: {
-        title: { number_of_fragments: 0 },
-        content: { fragment_size: 120, number_of_fragments: 3 },
-        phrases_en: { fragment_size: 40, number_of_fragments: 5 },
-      },
-      require_field_match: false,
-    },
-
-    size: 20,
-  };
-}
-
-/** Pure lexical fallback (no kNN, forgiving, with fuzziness) */
-function buildLexicalFallbackBody(args: {
-  entitiesQ: string[];
-  actionsQ: string[];
-  spansQ: string[];
-  paraQ: string[];
-  wantPol: "affirmative" | "negative";
-  payloadTime: "past" | "present" | "future" | "unspecified";
-  fallbackText: string;
-  rawQuery: string;
-}) {
-  const { entitiesQ, actionsQ, spansQ, paraQ, wantPol, payloadTime, fallbackText, rawQuery } = args;
-
-  const must: any[] = [];
-  if (entitiesQ.length) {
-    must.push({
-      bool: {
-        should: [
-          { terms: { entities: entitiesQ } },
-          ...entitiesQ.map((e) => ({ match: { "content.std":   { query: e, fuzziness: "AUTO" } } })),
-          ...entitiesQ.map((e) => ({ match: { "content.ascii": { query: e, fuzziness: "AUTO" } } })),
-          ...entitiesQ.map((e) => ({ match: { "title.std":     { query: e, fuzziness: "AUTO" } } })),
-        ],
-        minimum_should_match: 1,
-      },
+    // Use chunked search function from diaryChunkedIndexing service
+  const result = await searchChunkedDiaries(query, {
+      size,
+      from,
+      aggregateChunks: true // Group chunks back into diaries
     });
+
+    return result.hits;
+
+  } catch (err) {
+  console.error("[DiarySearch] Search failed:", err);
+    return [];
   }
-
-  const should: any[] = [];
-  if (actionsQ.length) {
-    should.push({ terms: { actions: actionsQ,      boost: 2.0 } });
-    should.push({ terms: { sensitive_en: actionsQ, boost: 1.6 } });
-
-    for (const a of actionsQ) {
-      should.push({ match_phrase: { "content":    { query: a, boost: 2.0 } } });
-      should.push({ match:        { "content.std":   { query: a, fuzziness: "AUTO", boost: 1.8 } } });
-      should.push({ match:        { "content.ascii": { query: a, fuzziness: "AUTO", boost: 1.6 } } });
-      should.push({ match:        { "title.std":     { query: a, fuzziness: "AUTO", boost: 1.4 } } });
-    }
-  }
-
-  for (const p of spansQ) {
-    should.push({ match_phrase: { "content":    { query: p, boost: 2.0 } } });
-    should.push({ match_phrase: { "phrases_en": { query: p, boost: 1.4 } } });
-  }
-
-  for (const p of paraQ.slice(0, 5)) {
-    should.push({ match_phrase: { "content": { query: p, boost: 1.0 } } });
-    should.push({ match_phrase: { "title":   { query: p, boost: 0.6 } } });
-  }
-
-  if (payloadTime !== "unspecified") {
-    should.push({ term: { time_label: { value: payloadTime, boost: 0.2 } } });
-  }
-  should.push({ term: { polarity: { value: wantPol, boost: 0.3 } } });
-
-  if (fallbackText) {
-    should.push({
-      multi_match: {
-        query: fallbackText,
-        fields: [
-          "title.std^1.6", "content.std^1.4",
-          "title.ascii^1.6","content.ascii^1.4",
-          "phrases_en^1.2",
-          "inquiry_en^1.2"
-        ],
-        type: "best_fields",
-        operator: "OR",
-        fuzziness: "AUTO",
-        minimum_should_match: "20%",
-      },
-    } as any);
-  }
-
-  // Direct fuzzy match on the original query as a catch-all in lexical fallback
-  if (rawQuery?.trim()) {
-    should.push({ match: { "content.std":  { query: rawQuery, fuzziness: "AUTO", minimum_should_match: "10%", boost: 0.8 } } });
-    should.push({ match: { "content.ascii":{ query: rawQuery, fuzziness: "AUTO", minimum_should_match: "10%", boost: 0.6 } } });
-  should.push({ match: { "inquiry_en":   { query: rawQuery, fuzziness: "AUTO", minimum_should_match: "10%", boost: 0.6 } } });
-  }
-
-  return {
-    min_score: 0.0,
-    query: {
-      bool: {
-        must,
-        should,
-        minimum_should_match: 0,
-      },
-    },
-    _source: [
-      "title",
-      "content",
-  "userId",
-      "entities",
-      "actions",
-      "sensitive_en",
-      "phrases_en",
-      "time_label",
-      "polarity",
-      "updatedAt",
-      "negated_actions_en",
-      "affirmed_actions_en",
-    ],
-    highlight: {
-      pre_tags: ["<mark>"],
-      post_tags: ["</mark>"],
-      fields: {
-        title: { number_of_fragments: 0 },
-        content: { fragment_size: 120, number_of_fragments: 3 },
-        phrases_en: { fragment_size: 40, number_of_fragments: 5 },
-      },
-      require_field_match: false,
-    },
-    size: 20,
-  };
 }
 
 /**
- * Semantic + lexical diary search (English-only) with en_simple expansions + robust fuzziness.
+ * Semantic + lexical diary search with chunking support
  */
 export async function searchDiariesSemantic(
   userQuery: string,
@@ -514,311 +390,100 @@ export async function searchDiariesSemantic(
     mode?: "wide" | "strict";
     scope?: "mine" | "others" | "all";
     userId?: string | null;
+    method?: "normal" | "vector" | "hybrid";
+    size?: number;
+    from?: number;
     logMeta?: { userId?: string | null; ip?: string | null; ua?: string | null } | null;
   }
 ): Promise<SearchHit[]> {
-  const mode = opts?.mode ?? "wide";
-  const scope = opts?.scope ?? "all";
-  const scopeUserId = (opts?.userId || "").trim();
-  const started = Date.now();
+  // Use new chunked search system
+  const primary = await searchDiariesSemanticChunked(userQuery, {
+    userId: opts?.userId || "",
+    mode: opts?.mode || "wide",
+    scope: opts?.scope || "all",
+    method: opts?.method || "normal",
+    size: opts?.size || 20,
+    from: opts?.from || 0,
+  });
 
-  // 1) Embed the raw query text
-  const qVec = await embedText(userQuery);
+  // If we already have hits, return them
+  if (primary.length) return primary;
 
-  // 2) Query-time clause graph (+ optional en_simple)
-  // Use default LLM model (GPT-5 preview if available)
-  const { DEFAULT_LLM_MODEL } = await import("../services/keywordExtractor.js");
-  const payload = await expandQuery(userQuery, { model: DEFAULT_LLM_MODEL, temperature: 0 });
-  const en = fromEnSimple(payload as any);
+  // Fallback: simple lexical search (broad) for Arabic queries that failed semantically
+  const looksArabic = /[\u0600-\u06FF]/.test(userQuery);
+  if (!looksArabic) return primary; // only apply fallback for Arabic
 
-  // 2.1) Log for analysis (best-effort)
   try {
-    await logQueryExpansion({
-      rawQuery: userQuery,
-      payload: payload as any,
-  model: DEFAULT_LLM_MODEL,
-      mode,
-      userId: opts?.logMeta?.userId ?? null,
-      ip: opts?.logMeta?.ip ?? null,
-      ua: opts?.logMeta?.ua ?? null,
-      latencyMs: Date.now() - started,
-    });
-  } catch {
-    /* ignore logging errors */
-  }
+    const simplified = normalizeArabic(userQuery).split(/\s+/).filter(Boolean);
+    if (!simplified.length) return primary;
 
-  // 3) Query bags (surface + en_simple) — all string[]
-  const entitiesQ: string[] = uniqStr([
-    ...ensureStrArray((payload as any).entities).map(low),
-    ...en.entities,
-    ...en.entitySynonyms,
-  ]);
+    // Build a should query with wildcards & match_phrases
+    const should: any[] = [];
+    for (const token of simplified) {
+      // Skip very short tokens
+      if (token.length < 2) continue;
+      should.push({ wildcard: { content: `*${escapeWildcard(token)}*` } });
+      should.push({ wildcard: { title: `*${escapeWildcard(token)}*` } });
+      should.push({ match_phrase: { content: { query: token, slop: 2 } } });
+    }
+    // Also attempt full simplified string as phrase
+    const fullSimple = simplified.join(" ");
+    if (fullSimple.length > 2) {
+      should.push({ match_phrase: { content: { query: fullSimple, slop: 3 } } });
+    }
 
-  const actionsFromClauses: string[] = getActionTokensFromClauses(payload).map(low);
-  const actionsFromInfinitives: string[] = getInfinitivesFromControlVerbs(payload);
-  const actionsQ: string[] = uniqStr([
-    ...actionsFromClauses,
-    ...actionsFromInfinitives,
-    ...en.actions,
-    ...en.actionSynonyms,
-  ]);
+    if (!should.length) return primary;
 
-  const spansQ: string[] = uniqStr([
-    ...getEventSpans(payload),
-    ...en.phrases,
-  ]);
+    // Direct ES search bypassing chunk aggregation for speed
+  // Use require to avoid ESM extension issues under node16 resolution
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { es } = require("../lib/es");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { DIARY_INDEX } = require("./diaryIndex");
+    if (!es) return primary;
 
-  const paraQ: string[] = uniqStr([...en.paraphrases]);
-  const normQ: string[] = getNormalizedTokens(userQuery);
-  const paraAll: string[] = uniqStr([...paraQ, ...normQ]);
-
-  // Sensitive verbs: actions bag
-  const sensitiveTerms: string[] = uniqStr([...actionsQ]); // reserved if needed later
-
-  // Time/Polarity (derived from graph; fallback to text negation)
-  const payloadTime = selectTimeLabel(payload);
-  const wantPol = selectPolarity(payload, userQuery);
-
-  // Optional kNN filter by entities
-  const knnFilterMust: any[] = [];
-  // Scope filter (mine, others, all)
-  const docFilterMust: any[] = [];
-  if (scope === "mine" && scopeUserId) {
-    // only my diaries
-    docFilterMust.push({ term: { userId: scopeUserId } });
-  } else if (scope === "others" && scopeUserId) {
-    // exclude my diaries
-    docFilterMust.push({ bool: { must_not: { term: { userId: scopeUserId } } } });
-  }
-  // Normalize entity tokens to avoid over-filtering on typos/pronouns
-  const PRONOUNS = new Set(["i","you","he","she","it","we","they","me","him","her","us","them"]);
-  const misspellingsMap2 = getMisspellingsMap();
-  const entsForFilter = entitiesQ
-    .map((e) => misspellingsMap2[e] || e)
-    .filter((e) => e && e.length >= 3 && !PRONOUNS.has(e));
-  if (mode === "strict" && entsForFilter.length) {
-    knnFilterMust.push({
-      bool: {
-        should: [{ terms: { entities: entsForFilter } }],
-        minimum_should_match: 1,
-      },
-    });
-  }
-  // Apply scope filters to kNN filter as well
-  if (docFilterMust.length) {
-    knnFilterMust.push(...docFilterMust);
-  }
-
-  // 4) Hybrid search (kNN + lexical with fuzziness)
-  const fallbackText = buildFallbackQuery(userQuery, spansQ, actionsQ, entitiesQ, [...en.phrases, ...paraAll]);
-
-  const body = buildMainBody({
-    qVec,
-    entitiesQ,
-    actionsQ,
-    spansQ,
-  paraQ: paraAll,
-    wantPol,
-    payloadTime,
-    knnFilterMust,
-  fallbackText,
-  rawQuery: userQuery,
-  });
-
-  // Inject document-level filters (scope) into main query
-  if ((body as any).query?.bool && docFilterMust.length) {
-    const b = (body as any).query.bool;
-    b.filter = Array.isArray(b.filter) ? [...b.filter, ...docFilterMust] : [...docFilterMust];
-  }
-
-  const res = await es.search<unknown>({
-    index: DIARY_INDEX,
-    ...(body as any),
-  });
-
-  let hits: SearchHit[] = (res as any).hits.hits as any;
-
-  // 5) Strict post-filter: prefer negation-aware buckets
-  if (hits.length && mode === "strict") {
-    const qSensitiveAll = new Set<string>(actionsQ.map(low).filter(Boolean));
-    // Attribute-like tokens from query (e.g., adjectives)
-    const qTokens = new Set<string>(getWordTokens(userQuery));
-    for (const a of actionsQ) qTokens.delete(low(a));
-    for (const e of entitiesQ) qTokens.delete(low(e));
-    const stopset = getStopwordSet();
-    if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
-    const qEntities = new Set<string>(entitiesQ.map(low).filter(Boolean));
-    const negRe = /\b(?:not|no|never|don['’]?t|didn['’]?t|doesn['’]?t|without)\b/;
-
-    hits = hits.filter((h) => {
-      const src: any = h._source || {};
-
-      const docPol = low(src.polarity || "");
-
-      const docAffVerbBag = new Set<string>((src.affirmed_actions_en || []).map(low));
-      const docNegVerbBag = new Set<string>((src.negated_actions_en  || []).map(low));
-      const docVerbBag    = new Set<string>(
-        ([...(src.actions || []), ...(src.sensitive_en || [])] as string[])
-          .map(low)
-          .filter(Boolean)
-      );
-
-  const hasAffOverlap = docAffVerbBag.size && hasOverlap(qSensitiveAll, docAffVerbBag);
-  const hasNegOverlap = docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag);
-  const hasAnyVerbOverlap = docVerbBag.size > 0 && hasOverlap(qSensitiveAll, docVerbBag);
-
-      const docText = toStr((src.content as string) || (src.title as string) || "").toLowerCase();
-      // Attribute gating near entity: if query is negative and attribute tokens appear near entity window without negation → exclude
-      const qAttrTokens = new Set<string>(Array.from(qTokens));
-      let attrHit = false;
-      let attrNeg = false;
-      if (qEntities.size > 0 && qAttrTokens.size) {
-        for (const e of Array.from(qEntities)) {
-          if (!docText.includes(e)) continue;
-          const idx = docText.indexOf(e);
-          const start = Math.max(0, idx - 64);
-          const end = Math.min(docText.length, idx + e.length + 64);
-          const win = docText.slice(start, end);
-          for (const t of Array.from(qAttrTokens)) { if (t.length < 3) continue; if (win.includes(t)) { attrHit = true; break; } }
-          if (negRe.test(win)) attrNeg = true;
-          if (attrHit && attrNeg) break;
-        }
-      }
-      if (wantPol === 'negative' && attrHit && !attrNeg) return false;
-
-      // Polarity-aware verb logic
-      if (qSensitiveAll.size > 0) {
-        if (wantPol === 'affirmative') {
-          if (hasAffOverlap || hasAnyVerbOverlap) return true;
-          return false;
-        } else {
-          // negative: require negated overlap, or negation near entity + any verb overlap
-          let negNearEntity = false;
-          if (qEntities.size > 0) {
-            for (const e of Array.from(qEntities)) {
-              if (!docText.includes(e)) continue;
-              const idx = docText.indexOf(e);
-              const start = Math.max(0, idx - 64);
-              const end = Math.min(docText.length, idx + e.length + 64);
-              if (negRe.test(docText.slice(start, end))) { negNearEntity = true; break; }
-            }
-          }
-          if (hasNegOverlap || (negNearEntity && hasAnyVerbOverlap)) return true;
-          return false;
-        }
-      }
-
-      // No explicit verbs in query: rely on doc polarity and negation presence
-      if ((docPol === 'affirmative' || docPol === 'negative') && docPol !== wantPol) return false;
-      if (wantPol === 'negative' && !negRe.test(docText)) return false;
-      return true;
-    });
-  }
-
-  // 6) Pure lexical fallback (no vector gate)
-  if (hits.length === 0) {
-    const lexBody = buildLexicalFallbackBody({
-      entitiesQ,
-      actionsQ,
-      spansQ,
-  paraQ: paraAll,
-      wantPol,
-      payloadTime,
-  fallbackText,
-  rawQuery: userQuery,
-    });
-
-  const res2 = await es.search<unknown>({
+    const resp = await es.search({
       index: DIARY_INDEX,
-      ...(lexBody as any),
+      size: opts?.size || 20,
+      query: {
+        bool: {
+          should,
+          minimum_should_match: 1,
+        },
+      },
+      highlight: { fields: { content: {}, title: {} } },
     });
 
-  let hits2: SearchHit[] = (res2 as any).hits.hits as any;
+    const fallbackHits = resp.hits?.hits || [];
+    if (!fallbackHits.length) return primary;
 
-    // Also enforce scope filters on lexical fallback results (post-filtering if needed)
-    if (docFilterMust.length) {
-      hits2 = hits2.filter((h: any) => {
-        const src: any = h._source || {};
-        if (scope === "mine" && scopeUserId) return String(src.userId || "") === scopeUserId;
-        if (scope === "others" && scopeUserId) return String(src.userId || "") !== scopeUserId;
-        return true;
-      });
-    }
-
-    if (mode === "strict") {
-      const qSensitiveAll = new Set<string>(actionsQ.map(low).filter(Boolean));
-      const qTokens = new Set<string>(getWordTokens(userQuery));
-      for (const a of actionsQ) qTokens.delete(low(a));
-      for (const e of entitiesQ) qTokens.delete(low(e));
-      const stopset = getStopwordSet();
-      if (stopset.size) for (const w of Array.from(qTokens)) if (stopset.has(w)) qTokens.delete(w);
-      const qEntities = new Set<string>(entitiesQ.map(low).filter(Boolean));
-      const negRe = /\b(?:not|no|never|don['’]?t|didn['’]?t|doesn['’]?t|without)\b/;
-
-      hits2 = hits2.filter((h) => {
-        const src: any = h._source || {};
-
-        const docPol = low(src.polarity || "");
-
-        const docAffVerbBag = new Set<string>((src.affirmed_actions_en || []).map(low));
-        const docNegVerbBag = new Set<string>((src.negated_actions_en  || []).map(low));
-        const docVerbBag    = new Set<string>(
-          ([...(src.actions || []), ...(src.sensitive_en || [])] as string[])
-            .map(low)
-            .filter(Boolean)
-        );
-
-  const hasAffOverlap = docAffVerbBag.size && hasOverlap(qSensitiveAll, docAffVerbBag);
-  const hasNegOverlap = docNegVerbBag.size && hasOverlap(qSensitiveAll, docNegVerbBag);
-  const hasAnyVerbOverlap = docVerbBag.size > 0 && hasOverlap(qSensitiveAll, docVerbBag);
-
-        const docText = toStr((src.content as string) || (src.title as string) || "").toLowerCase();
-        // Attribute gating near entity
-        const qAttrTokens = new Set<string>(Array.from(qTokens));
-        let attrHit = false;
-        let attrNeg = false;
-        if (qEntities.size > 0 && qAttrTokens.size) {
-          for (const e of Array.from(qEntities)) {
-            if (!docText.includes(e)) continue;
-            const idx = docText.indexOf(e);
-            const start = Math.max(0, idx - 64);
-            const end = Math.min(docText.length, idx + e.length + 64);
-            const win = docText.slice(start, end);
-            for (const t of Array.from(qAttrTokens)) { if (t.length < 3) continue; if (win.includes(t)) { attrHit = true; break; } }
-            if (negRe.test(win)) attrNeg = true;
-            if (attrHit && attrNeg) break;
-          }
-        }
-        if (wantPol === 'negative' && attrHit && !attrNeg) return false;
-
-        if (qSensitiveAll.size > 0) {
-          if (wantPol === 'affirmative') {
-            if (hasAffOverlap || hasAnyVerbOverlap) return true;
-            return false;
-          } else {
-            let negNearEntity = false;
-            if (qEntities.size > 0) {
-              for (const e of Array.from(qEntities)) {
-                if (!docText.includes(e)) continue;
-                const idx = docText.indexOf(e);
-                const start = Math.max(0, idx - 64);
-                const end = Math.min(docText.length, idx + e.length + 64);
-                if (negRe.test(docText.slice(start, end))) { negNearEntity = true; break; }
-              }
-            }
-            if (hasNegOverlap || (negNearEntity && hasAnyVerbOverlap)) return true;
-            return false;
-          }
-        }
-
-        if ((docPol === 'affirmative' || docPol === 'negative') && docPol !== wantPol) return false;
-        if (wantPol === 'negative' && !negRe.test(docText)) return false;
-        return true;
-      });
-    }
-
-    return hits2;
+    // Tag these as fallback for frontend logic (add marker in _source)
+    return fallbackHits.map((h: any) => ({
+      ...h,
+      _source: { ...(h._source || {}), _fallback: true },
+    }));
+  } catch (e) {
+    console.warn("[DiarySearch] fallback Arabic lexical search failed", e);
+    return primary;
   }
+}
 
-  return hits;
+// Normalize Arabic text: remove diacritics, unify alef forms, etc.
+function normalizeArabic(input: string): string {
+  return input
+    // remove tashkeel
+    .replace(/[\u0610-\u061A\u064B-\u065F\u06D6-\u06ED]/g, "")
+    // various alef forms -> ا
+    .replace(/[\u0622\u0623\u0625\u0671]/g, "ا")
+    // ya & alef maqsura unify
+    .replace(/[\u0649\u064A]/g, "ي")
+    // taa marbuta -> ه (or can map to ة; choose consistency)
+    .replace(/ة/g, "ه")
+    // remove tatweel
+    .replace(/ـ/g, "")
+    .trim();
+}
+
+function escapeWildcard(token: string): string {
+  return token.replace(/[?*]/g, "");
 }

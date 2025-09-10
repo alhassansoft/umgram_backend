@@ -2,6 +2,8 @@
 import { Request, Response, NextFunction } from "express";
 import { DiaryModel } from "../models/diaryModel";
 import { indexDiary, removeDiaryFromIndex } from "../search/diaryIndex";
+import { KeywordNormalizationJobProcessor } from "../jobs/keywordNormalizationJobProcessor";
+import { ensureDiaryExtraction } from "../services/diaryExtraction";
 
 // إنشاء
 export async function createDiary(
@@ -21,6 +23,21 @@ export async function createDiary(
     indexDiary(diary).catch((e) =>
       console.error("[Elastic] index create failed:", e)
     );
+
+    // إنشاء job لمعالجة الكلمات المفتاحية + إنشاء استخراج الكيانات في الخلفية (لا يحجب الاستجابة)
+    if (content && content.trim()) {
+      KeywordNormalizationJobProcessor.createJobIfNeeded(
+        content,
+        'diary',
+        diary.id,
+        userId,
+        { priority: 1 }
+      ).catch((e) => console.error("[KeywordJob] create failed:", e));
+
+      ensureDiaryExtraction(diary).catch((e) =>
+        console.error("[DiaryExtraction] auto create after diary creation failed", e)
+      );
+    }
 
     return res.status(201).json(diary);
   } catch (err) {
@@ -86,6 +103,21 @@ export async function updateDiary(
     indexDiary(diary).catch((e) =>
       console.error("[Elastic] index update failed:", e)
     );
+
+    // إنشاء job + إعادة بناء استخراج إذا تم تحديث المحتوى
+    if (patch.content && patch.content.trim()) {
+      KeywordNormalizationJobProcessor.createJobIfNeeded(
+        patch.content,
+        'diary',
+        diary.id,
+        diary.userId,
+        { priority: 1, forceReprocess: true }
+      ).catch((e) => console.error("[KeywordJob] update failed:", e));
+
+      ensureDiaryExtraction(diary, { force: true }).catch((e) =>
+        console.error("[DiaryExtraction] auto rebuild after diary update failed", e)
+      );
+    }
 
     return res.json(diary);
   } catch (err) {

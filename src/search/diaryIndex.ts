@@ -29,6 +29,7 @@ export async function ensureDiaryIndex() {
       mappings: {
         properties: {
           id:        { type: "keyword" },
+          originalId: { type: "keyword" }, // For linking chunks to original diary
           userId:    { type: "keyword" },
           title: {
             type: "text",
@@ -49,6 +50,11 @@ export async function ensureDiaryIndex() {
           },
           createdAt: { type: "date" },
           updatedAt: { type: "date" },
+          isChunk: { type: "boolean" }, // Whether this is a chunk or full document
+          chunkIndex: { type: "integer" }, // Index of this chunk
+          totalChunks: { type: "integer" }, // Total number of chunks for the document
+          characterStart: { type: "integer" }, // Character position where chunk starts
+          characterEnd: { type: "integer" }, // Character position where chunk ends
           entities:   { type: "keyword" },
           actions:    { type: "keyword" },
           attributes: { type: "keyword" },
@@ -70,6 +76,7 @@ export async function ensureDiaryIndex() {
     await es.indices.putMapping({
       index: DIARY_INDEX,
       properties: {
+        originalId: { type: "keyword" }, // For linking chunks to original diary
         title: {
           type: "text",
           analyzer: "english",
@@ -87,18 +94,23 @@ export async function ensureDiaryIndex() {
             ascii:{ type: "text", analyzer: "en_ascii" },
           },
         },
-  entities:   { type: "keyword" },
-  actions:    { type: "keyword" },
-  attributes: { type: "keyword" },
-  // Keep same analyzer as initial creation to avoid conflicts
-  inquiry_en: { type: "text", analyzer: "english" },
+        isChunk: { type: "boolean" }, // Whether this is a chunk or full document
+        chunkIndex: { type: "integer" }, // Index of this chunk
+        totalChunks: { type: "integer" }, // Total number of chunks for the document
+        characterStart: { type: "integer" }, // Character position where chunk starts
+        characterEnd: { type: "integer" }, // Character position where chunk ends
+        entities:   { type: "keyword" },
+        actions:    { type: "keyword" },
+        attributes: { type: "keyword" },
+        // Keep same analyzer as initial creation to avoid conflicts
+        inquiry_en: { type: "text", analyzer: "english" },
         time_label: { type: "keyword" },
         polarity:   { type: "keyword" },
-  entities_syn_en:   { type: "keyword" },
-  actions_syn_en:    { type: "keyword" },
-  attributes_syn_en: { type: "keyword" },
-  // Keep same analyzer as initial creation
-  phrases_en:        { type: "text", analyzer: "english" },
+        entities_syn_en:   { type: "keyword" },
+        actions_syn_en:    { type: "keyword" },
+        attributes_syn_en: { type: "keyword" },
+        // Keep same analyzer as initial creation
+        phrases_en:        { type: "text", analyzer: "english" },
         sensitive_en:      { type: "keyword" },
         negated_actions_en:  { type: "keyword" },
         affirmed_actions_en: { type: "keyword" },

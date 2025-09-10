@@ -1,7 +1,7 @@
 // src/controllers/noteExtractionsController.ts
 import { Request, Response, NextFunction } from "express";
 import { NoteModel } from "../models/noteModel";
-import { extractKeywords, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
+import { extractKeywords, extractKeywordsChunked, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
 import { saveExtraction, getExtractionByContent } from "../services/extractions";
 import { attachExtractionToNoteInES } from "../search/noteIndex";
 
@@ -21,7 +21,16 @@ export async function rebuildNoteExtraction(req: Request, res: Response, next: N
     if (!note) return res.status(404).json({ error: "Note not found" });
 
     const text = `${note.title}\n\n${note.content ?? ""}`;
-    const payload = await extractKeywords(text, { model: DEFAULT_LLM_MODEL, temperature: 0 });
+    
+    // Use chunked extraction for long notes to avoid timeouts
+    const payload = text.length > 3000 
+      ? await extractKeywordsChunked(text, { 
+          model: DEFAULT_LLM_MODEL, 
+          temperature: 0,
+          maxTokensPerChunk: 1800,
+          mergeStrategy: 'intelligent'
+        })
+      : await extractKeywords(text, { model: DEFAULT_LLM_MODEL, temperature: 0 });
 
     const { id: extractionId } = await saveExtraction({
       contentType: "note",
@@ -35,7 +44,7 @@ export async function rebuildNoteExtraction(req: Request, res: Response, next: N
 
     await attachExtractionToNoteInES(note, payload);
 
-    return res.json({ ok: true, id: extractionId, payload });
+    return res.json({ ok: true, id: extractionId, payload, chunked: text.length > 3000 });
   } catch (err) { next(err); }
 }
 

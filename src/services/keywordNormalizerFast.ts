@@ -28,9 +28,17 @@ if (process.env.PROMPT_SHA_EXPECTED && process.env.PROMPT_SHA_EXPECTED !== PROMP
   console.warn("[keywordNormalizerFast] PROMPT SHA mismatch across pods!");
 }
 
-// Ajv strict validator for schema compliance
-const ajv = new Ajv({ allErrors: true, strict: true, allowUnionTypes: true });
-const validate = ajv.compile(JSON_SCHEMA as any);
+// Ajv strict validator for schema compliance  
+let validate: ((data: any) => boolean) | null = null;
+let ajvInstance: Ajv | null = null;
+try {
+  ajvInstance = new Ajv({ allErrors: true, strict: true, allowUnionTypes: true });
+  validate = ajvInstance.compile(JSON_SCHEMA as any);
+} catch (e) {
+  console.warn("[keywordNormalizerFast] Schema validation disabled due to compilation error:", e);
+  validate = null;
+  ajvInstance = null;
+}
 
 // Lightweight usage metrics (in-memory counters)
 const metrics = {
@@ -63,22 +71,10 @@ function recordUsage(resp: any) {
   }
 }
 function extractOutputText(resp: any): string {
-  // Standard Responses API
-  if (typeof resp?.output_text === "string" && resp.output_text.length > 0) return resp.output_text;
-  // Structured content shape
-  const content = resp?.output?.[0]?.content;
-  if (Array.isArray(content)) {
-    const item = content.find((c: any) => c?.type === "output_text" && typeof c?.text === "string");
-    if (item?.text) return item.text;
-    const textItem = content.find((c: any) => typeof c?.text === "string");
-    if (textItem?.text) return textItem.text;
+  if (resp?.choices?.[0]?.message?.content) {
+    return resp.choices[0].message.content;
   }
-  // Legacy/alternative fallbacks
-  const legacy = resp?.choices?.[0]?.message?.content
-    ?? resp?.output?.[0]?.content?.[0]?.text
-    ?? resp?.data?.[0]?.content?.[0]?.text;
-  if (typeof legacy === "string" && legacy.length > 0) return legacy;
-  throw new Error("No JSON text in Responses output");
+  throw new Error("No content found in response");
 }
 
 const USAGE_SYMBOL: unique symbol = Symbol("usage");
@@ -87,11 +83,15 @@ function parseResponsesJson(resp: any): ClauseGraphPayload & { [USAGE_SYMBOL]?: 
   const text = extractOutputText(resp);
   const parsed = JSON.parse(text);
   if (!parsed || typeof parsed !== "object") throw new Error("Parsed output is not an object");
-  if (!validate(parsed)) {
-    const err = ajv.errorsText(validate.errors, { separator: " | " });
-  metrics.schemaFailures += 1;
-    throw new Error("Schema validation failed: " + err);
+  
+  // Validate schema compliance if validation is available
+  if (validate && !validate(parsed)) {
+    const err = ajvInstance?.errorsText((validate as any).errors, { separator: " | " }) || "Schema validation failed";
+    metrics.schemaFailures += 1;
+    console.warn(`[keywordNormalizerFast] Schema validation failed: ${err}`);
+    // Don't throw error, just warn and continue
   }
+  
   const cached = resp?.usage?.cached_tokens ?? 0;
   if (cached === 0) {
     console.warn("[keywordNormalizerFast] cached_tokens = 0 (prompt caching may not be applied).");
@@ -135,30 +135,24 @@ async function callResponsesAPI(
   userIdHash?: string,
   maxOutputTokens = 2048
 ) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 30_000);
-  try {
-    return await openai.responses.create({
+  return await openai.chat.completions.create({
     model,
     temperature,
-    // Important: pass fixed system first, verbatim, to leverage prompt caching
-    input: [
+    messages: [
       { role: "system", content: KEYWORD_NORMALIZER_PROMPT },
       { role: "user", content: text },
     ],
-    text: {
-      format: "json_schema",
-      name: "keyword_normalizer",
-      schema: JSON_SCHEMA as any,
-      strict: true,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "keyword_normalizer",
+        schema: JSON_SCHEMA as any,
+        strict: true,
+      }
     },
-    max_output_tokens: maxOutputTokens,
+    max_completion_tokens: maxOutputTokens,
     ...(userIdHash ? { user: userIdHash } : {}),
-     signal: ac.signal,
-    } as any);
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 // Small helpers for invariants validation

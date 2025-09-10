@@ -1,6 +1,6 @@
 // Runs periodically to extract entities/actions from chat messages and store into entity_extractions as content_type='chat'
 import { pool } from "../db";
-import { extractKeywords, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
+import { extractKeywords, extractKeywordsChunked, DEFAULT_LLM_MODEL } from "../services/keywordExtractor";
 import { saveExtraction } from "../services/extractions";
 
 // Process up to N conversations per run; mark processed to avoid duplication
@@ -52,7 +52,15 @@ export async function runChatExtractionOnce() {
       continue;
     }
 
-    const payload = await extractKeywords(text, { model: DEFAULT_LLM_MODEL, temperature: 0 });
+    // Use chunked extraction for long chat histories to avoid timeouts
+    const payload = text.length > 3000 
+      ? await extractKeywordsChunked(text, { 
+          model: DEFAULT_LLM_MODEL, 
+          temperature: 0,
+          maxTokensPerChunk: 1800,
+          mergeStrategy: 'intelligent'
+        })
+      : await extractKeywords(text, { model: DEFAULT_LLM_MODEL, temperature: 0 });
     await saveExtraction({
       contentType: 'chat',
       contentId: (c as any).id,

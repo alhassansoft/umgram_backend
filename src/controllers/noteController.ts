@@ -2,6 +2,7 @@
 import { Request, Response, NextFunction } from "express";
 import { NoteModel } from "../models/noteModel";
 import { indexNote } from "../search/noteIndex";
+import { KeywordNormalizationJobProcessor } from "../jobs/keywordNormalizationJobProcessor";
 
 // إنشاء
 export async function createNote(
@@ -15,10 +16,25 @@ export async function createNote(
       return res.status(400).json({ error: "title و userId مطلوبان" });
     }
 
-  const note = await NoteModel.create({ title, content, userId });
-  // index in ES (best-effort)
-  indexNote(note).catch((e) => console.error("[Elastic] note index create failed:", e));
-  return res.status(201).json(note);
+    const note = await NoteModel.create({ title, content, userId });
+    
+    // index in ES (best-effort)
+    indexNote(note).catch((e) => console.error("[Elastic] note index create failed:", e));
+    
+    // إنشاء job لمعالجة الكلمات المفتاحية في الخلفية
+    if (content && content.trim()) {
+      KeywordNormalizationJobProcessor.createJobIfNeeded(
+        content,
+        'note',
+        note.id,
+        userId,
+        { priority: 1 }
+      ).catch((e) =>
+        console.error("[KeywordJob] note create failed:", e)
+      );
+    }
+    
+    return res.status(201).json(note);
   } catch (err) {
     next(err);
   }
@@ -74,10 +90,25 @@ export async function updateNote(
     if (typeof req.body.title !== "undefined") patch.title = req.body.title;
     if (typeof req.body.content !== "undefined") patch.content = req.body.content;
 
-  const note = await NoteModel.update(id, patch);
+    const note = await NoteModel.update(id, patch);
     if (!note) return res.status(404).json({ error: "Not found" });
-  indexNote(note).catch((e) => console.error("[Elastic] note index update failed:", e));
-  return res.json(note);
+    
+    indexNote(note).catch((e) => console.error("[Elastic] note index update failed:", e));
+    
+    // إنشاء job لمعالجة الكلمات المفتاحية إذا تم تحديث المحتوى
+    if (patch.content && patch.content.trim()) {
+      KeywordNormalizationJobProcessor.createJobIfNeeded(
+        patch.content,
+        'note',
+        note.id,
+        note.userId,
+        { priority: 1, forceReprocess: true }
+      ).catch((e) =>
+        console.error("[KeywordJob] note update failed:", e)
+      );
+    }
+    
+    return res.json(note);
   } catch (err) {
     next(err);
   }

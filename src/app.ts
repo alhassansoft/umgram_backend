@@ -23,6 +23,7 @@ import challengeRoutes from "./routes/challengeRoutes";
 import notificationsRoutes from "./routes/notificationsRoutes";
 import searchHistoryRoutes from "./routes/searchHistoryRoutes";
 import adminRoutes from "./routes/adminRoutes";
+import jobsRoutes from "./routes/jobsRoutes";
 
 // ❌ لا تستخدم searchRoutes القديم
 // import searchRoutes from "./routes/searchRoutes";
@@ -32,6 +33,7 @@ import search from "./routes/search";
 
 import { requireAuth } from "./middleware/auth";
 import { normalizeKeywordsFast, PROMPT_SHA, validateInvariants } from "./services/keywordNormalizerFast";
+import { normalizeKeywordsChunked } from "./services/keywordNormalizerChunked";
 import rateLimit from "express-rate-limit";
 
 export const app = express();
@@ -68,7 +70,24 @@ try {
 } catch {}
 app.use('/uploads', express.static(uploadsDir));
 
+// Serve public directory for admin pages
+const publicDir = path.resolve(process.cwd(), 'public');
+try {
+  fs.mkdirSync(publicDir, { recursive: true });
+} catch {}
+app.use('/admin', express.static(publicDir));
+
 app.get("/health", (_req, res) => res.send("ok"));
+
+// Temporary debug endpoint to inspect auth header & decoded token
+app.get('/api/debug/auth', (req, res) => {
+  const auth = req.headers.authorization || null;
+  res.json({
+    hasAuthHeader: Boolean(auth),
+    authHeaderPrefix: auth ? auth.split(' ')[0] : null,
+    user: req.user || null,
+  });
+});
 
 // Quick test endpoint for the fast keyword normalizer
 // Simple per-IP rate limit for test endpoint
@@ -87,6 +106,45 @@ app.post("/api/normalize/fast", normLimiter, async (req, res) => {
   const usage = (payload as any)[Object.getOwnPropertySymbols(payload)[0] as symbol] || {};
   const modelUsed = process.env.LLM_MODEL || process.env.OPENAI_CHAT_MODEL || "gpt-5-preview";
   res.json({ ok: true, promptSha: PROMPT_SHA, modelUsed, usage, payload });
+  } catch (e: any) {
+    const status = typeof e?.status === "number" ? e.status : 400;
+    res.status(status).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Chunked keyword normalizer for long texts
+app.post("/api/normalize/chunked", normLimiter, async (req, res) => {
+  try {
+    const text = String(req.body?.text ?? "");
+    const maxChars = 50_000; // Allow larger inputs for chunked processing
+    if (text.length > maxChars) {
+      return res.status(413).json({ ok: false, error: `Input too large (${text.length} chars). Limit=${maxChars}` });
+    }
+    
+    const userId = String(req.user?.sub ?? req.ip ?? "anon");
+    const maxTokensPerChunk = Number(req.body?.maxTokensPerChunk) || 1800;
+    const mergeStrategy = req.body?.mergeStrategy === 'simple' ? 'simple' : 'intelligent';
+    
+    const startTime = Date.now();
+    const payload = await normalizeKeywordsChunked(text, { 
+      user: userId,
+      maxTokensPerChunk,
+      mergeStrategy
+    });
+    const processingTime = Date.now() - startTime;
+    
+    const inv = validateInvariants(payload);
+    if (inv.length) console.warn("[/api/normalize/chunked] invariants:", inv);
+    
+    const modelUsed = process.env.LLM_MODEL || process.env.OPENAI_CHAT_MODEL || "gpt-5-preview";
+    res.json({ 
+      ok: true, 
+      promptSha: PROMPT_SHA, 
+      modelUsed, 
+      processingTime,
+      chunked: text.length > 3000,
+      payload 
+    });
   } catch (e: any) {
     const status = typeof e?.status === "number" ? e.status : 400;
     res.status(status).json({ ok: false, error: String(e?.message || e) });
@@ -113,6 +171,7 @@ app.use(matchRoutes);
 app.use(notificationsRoutes);
 app.use(searchHistoryRoutes);
 app.use(adminRoutes);
+app.use("/api/jobs", jobsRoutes);
 
 // ⚠️ مهم: راوتر البحث الجديد يعلن المسارات بنفسه (يتضمن /api/search)
 // لذلك لا تُضيف بادئة /api هنا حتى لا تصبح /api/api/search.

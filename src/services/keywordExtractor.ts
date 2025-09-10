@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageToolCall } from "openai/resources/chat/completions";
 import { KEYWORD_NORMALIZER_PROMPT } from "../prompts/keywordNormalizer";
 import { QUERY_EXPANDER_PROMPT } from "../prompts/queryExpander";
+import { normalizeKeywordsChunked } from "./keywordNormalizerChunked";
 
 /* ============================
  * Types – Clause Graph
@@ -366,6 +367,36 @@ export async function extractKeywords(
   opts?: { model?: string; temperature?: number }
 ): Promise<ClauseGraphPayload> {
   return runClauseGraph(KEYWORD_NORMALIZER_PROMPT, text, opts);
+}
+
+/** 
+ * Enhanced keyword extraction with automatic chunking for long texts
+ * Use this for diary entries that might be very long to avoid timeouts
+ */
+export async function extractKeywordsChunked(
+  text: string,
+  opts?: { 
+    model?: string; 
+    temperature?: number;
+    maxTokensPerChunk?: number;
+    chunkOptions?: any;
+    mergeStrategy?: 'simple' | 'intelligent';
+  }
+): Promise<ClauseGraphPayload> {
+  // For short texts, use the regular method
+  if (!text || text.length <= 3000) {
+    return extractKeywords(text, opts);
+  }
+
+  // For long texts, use the chunked normalizer  
+  const chunkOptions: any = {};
+  if (opts?.model !== undefined) chunkOptions.model = opts.model;
+  if (opts?.temperature !== undefined) chunkOptions.temperature = opts.temperature;
+  if (opts?.maxTokensPerChunk !== undefined) chunkOptions.maxTokensPerChunk = opts.maxTokensPerChunk;
+  if (opts?.chunkOptions !== undefined) chunkOptions.chunkOptions = opts.chunkOptions;
+  if (opts?.mergeStrategy !== undefined) chunkOptions.mergeStrategy = opts.mergeStrategy;
+  
+  return normalizeKeywordsChunked(text, chunkOptions);
 }
 
 /** Query-time clause expander */

@@ -1,4 +1,4 @@
-// src/index.ts
+// src/server/index.ts
 import * as dotenv from "dotenv";
 dotenv.config();
 
@@ -9,6 +9,7 @@ import { ensureNoteIndex } from "./search/noteIndex";
 import { ensureChatIndex } from "./search/chatIndex";
 import { ensureMicroblogIndex } from "./search/microblogIndex";
 import { scheduleChatExtraction } from "./jobs/chatExtractionJob";
+import { JobProcessor } from "./jobs/jobProcessor";
 
 const PORT = Number(process.env.PORT ?? 5001);
 
@@ -37,6 +38,11 @@ async function start() {
 
   // Start background job to extract chat conversations every N hours (default 24)
   scheduleChatExtraction();
+  
+  // Start job processor for keyword normalization and other background tasks
+  const jobIntervalMs = Number(process.env.JOB_PROCESSOR_INTERVAL_MS ?? 5000);
+  JobProcessor.start(jobIntervalMs);
+  console.log(`[jobs] processor started with ${jobIntervalMs}ms interval`);
 }
 
 start();

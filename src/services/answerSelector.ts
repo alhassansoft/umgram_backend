@@ -120,6 +120,13 @@ export async function selectAnswer(
     .filter((x): x is MinimalHit => !!x)
     .slice(0, 10);
 
+  // Build quick lookup map for post-processing (key: id -> hit)
+  const hitMap: Record<string, MinimalHit> = {};
+  for (const h of trimmed) hitMap[h.id] = h;
+
+
+  // Removed heuristic time extraction logic per request; rely solely on model reasoning.
+
   const payload = {
     question: String(question || "").trim(),
     hits: trimmed,
@@ -193,6 +200,7 @@ export async function selectAnswer(
   if (!parsed) {
     return buildNoneResult(question, trimmed.length);
   }
+  // Removed post-answer time mismatch override per request.
   return parsed as AnswerSelectionResult;
 }
 
